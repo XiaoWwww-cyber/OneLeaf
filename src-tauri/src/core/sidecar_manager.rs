@@ -65,8 +65,11 @@ pub fn init_sidecar(app: &AppHandle) {
 
     // 启动 ASR GPU 服务
     let mut cmd = Command::new(&python_path);
-    cmd.arg(&asr_script)
+    cmd.arg("-u") // 强制无缓冲输出
+        .arg(&asr_script)
         .env("ASR_GPU_PORT", ASR_GPU_PORT.to_string())
+        .env("PYTHONUNBUFFERED", "1")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
         .current_dir(&resource_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

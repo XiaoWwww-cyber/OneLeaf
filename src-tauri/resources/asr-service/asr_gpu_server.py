@@ -182,95 +182,88 @@ def stream_decode_wav(audio_path: str, chunk_duration_s: int = 30):
 
 def load_model(use_gpu: bool = True, gpu_device_id: int = 0, num_threads: int = 4) -> bool:
     """加载 SenseVoice 模型"""
-    global recognizer, current_device, model_loaded, current_num_threads
+    global recognizer, current_device, model_loaded
     
-    current_num_threads = num_threads
-    
+    if model_loaded and recognizer is not None:
+        return True
+        
     try:
         import sherpa_onnx
-        
         models_dir = get_models_dir()
-        print(f"[ASR-GPU] 模型目录: {models_dir}")
         
         # 检查模型文件
-        model_file = models_dir / "model.onnx"
-        model_int8 = models_dir / "model.int8.onnx"
-        tokens_file = models_dir / "tokens.txt"
+        model_file = models_dir / MODEL_FILE
+        tokens_file = models_dir / TOKENS_FILE
         
-        # 优先使用非量化模型 (GPU 友好)
-        if model_file.exists():
-            actual_model = str(model_file)
-        elif model_int8.exists():
-            actual_model = str(model_int8)
-        else:
-            print(f"[ASR-GPU] 模型文件不存在: {model_file}")
+        print(f"[ASR-GPU] 正在从目录加载模型: {models_dir}", flush=True)
+        
+        if not model_file.exists():
+            print(f"[ASR-GPU] 错误: 找不到模型文件 {model_file}", flush=True)
             return False
-        
         if not tokens_file.exists():
-            print(f"[ASR-GPU] tokens 文件不存在: {tokens_file}")
+            print(f"[ASR-GPU] 错误: 找不到 tokens 文件 {tokens_file}", flush=True)
             return False
         
-        # 智能选择 provider：尝试 CUDA，失败回退 CPU
+        # 智能选择推理后端
         provider = "cpu"
-        current_device = "CPU"
+        device_name = "CPU"
         
         if use_gpu:
-            # 检查是否有 NVIDIA GPU
-            gpu_available, gpu_name, _ = detect_gpu()
-            if gpu_available and "nvidia" in gpu_name.lower():
-                print(f"[ASR-GPU] 检测到 NVIDIA GPU: {gpu_name}，尝试 CUDA 加速...")
-                try:
-                    # 先尝试用 CUDA 加载
-                    test_recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
-                        model=actual_model,
-                        tokens=str(tokens_file),
-                        num_threads=4,
-                        provider="cuda",
-                        language="auto",
-                        use_itn=True,
-                        debug=False,
-                    )
-                    # 成功了！
+            gpu_available, gpu_info, _ = detect_gpu()
+            if gpu_available:
+                if "nvidia" in gpu_info.lower():
+                    print(f"[ASR-GPU] 检测到 NVIDIA GPU，启用 CUDA 加速", flush=True)
                     provider = "cuda"
-                    current_device = "GPU (CUDA)"
-                    print("[ASR-GPU] ✅ CUDA 加速已启用！")
-                    # 直接使用这个 recognizer
-                    recognizer = test_recognizer
-                except Exception as e:
-                    print(f"[ASR-GPU] ⚠️ CUDA 初始化失败: {e}")
-                    print("[ASR-GPU] 回退到 CPU 模式")
-                    provider = "cpu"
-            else:
-                print(f"[ASR-GPU] 未检测到 NVIDIA GPU (当前: {gpu_name})，使用 CPU 模式")
+                    device_name = f"GPU (CUDA: {gpu_info})"
+                else:
+                    # Windows 上非 NVIDIA 显卡可以使用 directml
+                    print(f"[ASR-GPU] 检测到非 NVIDIA GPU，尝试 DirectML 加速", flush=True)
+                    provider = "directml"
+                    device_name = f"GPU (DirectML: {gpu_info})"
         
-        print(f"[ASR-GPU] 最终配置: Provider={provider}, Threads={num_threads}")
-        
+        print(f"[ASR-GPU] 启动推理引擎: provider={provider}, threads={num_threads}", flush=True)
         start_time = time.time()
         
-        # 如果还没创建 recognizer（没走 CUDA 分支或 CUDA 失败）
-        if provider == "cpu":
-            recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
-                model=actual_model,
+        try:
+            # 首次尝试 (CUDA/DirectML)
+            new_recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
+                model=str(model_file),
                 tokens=str(tokens_file),
                 num_threads=num_threads,
                 provider=provider,
                 language="auto",
                 use_itn=True,
-                debug=True,
+                debug=False,
             )
+            recognizer = new_recognizer
+            current_device = device_name
+        except Exception as e:
+            if provider != "cpu":
+                print(f"[ASR-GPU] 硬件加速初始化失败 ({e})，正在回退到 CPU 模式...", flush=True)
+                new_recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
+                    model=str(model_file),
+                    tokens=str(tokens_file),
+                    num_threads=num_threads,
+                    provider="cpu",
+                    language="auto",
+                    use_itn=True,
+                    debug=False,
+                )
+                recognizer = new_recognizer
+                current_device = "CPU (Fallback)"
+            else:
+                raise e
         
         load_time = time.time() - start_time
-        print(f"[ASR-GPU] 模型加载完成，耗时: {load_time:.2f}s")
-        print(f"[ASR-GPU] 当前设备: {current_device}")
-        
+        print(f"[ASR-GPU] 模型加载成功! 耗时: {load_time:.2f}s, 当前设备: {current_device}", flush=True)
         model_loaded = True
         return True
         
     except Exception as e:
-        print(f"[ASR-GPU] 模型加载失败: {e}")
+        print(f"[ASR-GPU] 模型加载发生致命错误: {e}", flush=True)
         import traceback
         traceback.print_exc()
-        current_device = "Error"
+        model_loaded = False
         return False
 
 @app.get("/health")
@@ -332,42 +325,47 @@ def transcribe_generator(request: TranscribeRequest):
     full_text = []
     
     try:
-        print(f"[ASR-GPU] 开始流式转写: {request.audio_path}")
+        audio_size = os.path.getsize(request.audio_path)
+        print(f"[ASR-GPU] Started transcription: {request.audio_path} (size: {audio_size} bytes)")
+        
         chunk_gen = stream_decode_wav(request.audio_path, chunk_duration_s=30)
         
+        chunk_idx = 0
         for samples, progress, is_last, sample_rate, duration_ms in chunk_gen:
             if is_last:
+                print(f"[ASR-GPU] All chunks read")
                 break
                 
             if not samples:
                 continue
 
-            # 每个块创建一个流 (SenseVoice 此处简化处理，理想情况应维护 context)
+            chunk_idx += 1
+            print(f"[ASR-GPU] Processing chunk {chunk_idx}, progress: {progress:.2%}")
+            
+            # Create stream for each chunk
             stream = recognizer.create_stream()
             stream.accept_waveform(sample_rate, samples)
             recognizer.decode_stream(stream)
             chunk_text = stream.result.text
             
             if chunk_text:
+                print(f"[ASR-GPU] Chunk {chunk_idx} text: {chunk_text}")
                 full_text.append(chunk_text)
+            else:
+                print(f"[ASR-GPU] Chunk {chunk_idx} produced no text")
             
-            # 调整进度显示 (0.01 - 0.99)
             display_progress = min(0.99, max(0.01, progress))
             yield f"data: {json.dumps({'status': 'processing', 'progress': display_progress})}\n\n"
             
-            # 手动触发 GC，以防 accumulating garbage
-            # import gc; gc.collect() 
-
-        # 4. 汇总
+        # Summary
         final_text = "".join(full_text)
         process_duration = (time.time() - start_time) * 1000
         
-        # 再次获取时长用于计算 RTF
-        total_duration_ms = duration_ms # 从 stream_decode_wav 最后的 yield 获取
+        print(f"[ASR-GPU] Transcription finished, total text length: {len(final_text)}")
         
+        total_duration_ms = duration_ms
         rtf = process_duration / total_duration_ms if total_duration_ms > 0 else 0
-        
-        print(f"[ASR-GPU] 转写完成，RTF: {rtf:.3f}, 时长: {total_duration_ms}ms")
+        print(f"[ASR-GPU] Summary: RTF={rtf:.3f}, Duration={total_duration_ms}ms, Processed in={process_duration:.1f}ms")
         
         response = {
             "status": "success",

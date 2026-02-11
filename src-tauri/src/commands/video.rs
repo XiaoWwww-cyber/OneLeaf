@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 use tauri::{AppHandle, Manager};
+use tracing::{error, info};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct VideoInfo {
@@ -44,18 +45,24 @@ pub async fn transcribe_video(
     app: AppHandle,
     video_path: String,
 ) -> Result<TranscriptResult, String> {
+    info!("[Video] 开始转写视频: {}", video_path);
     let temp_dir = get_temp_dir(&app);
     fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
 
     let video_id = uuid::Uuid::new_v4().to_string();
     let audio_path = temp_dir.join(format!("{}.wav", video_id));
+    info!("[Video] 临时音频路径: {:?}", audio_path);
 
     // 1. 提取音频 - 使用内嵌的 ffmpeg 或系统 ffmpeg
     let ffmpeg_path = find_ffmpeg(&app);
+    info!("[Video] 使用 FFmpeg 路径: {}", ffmpeg_path);
     extract_audio_with_ffmpeg(&ffmpeg_path, &video_path, &audio_path)?;
+    info!("[Video] 音频提取完成");
 
     // 2. 调用 ASR GPU 服务进行转写
+    info!("[Video] 调用 ASR 服务...");
     let text = call_asr_service(&audio_path).await?;
+    info!("[Video] ASR 转写成功，字数: {}", text.len());
 
     // 3. 清理临时音频文件
     let _ = fs::remove_file(&audio_path);
@@ -103,18 +110,26 @@ fn extract_audio_with_ffmpeg(
         .arg("-y")
         .arg(audio_path);
 
+    info!("[Video] 执行 FFmpeg 命令: {:?}", cmd);
+
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
 
-    let output = cmd.output().map_err(|e| format!("FFmpeg 执行失败: {}", e))?;
+    let output = cmd.output().map_err(|e| {
+        error!("[Video] FFmpeg 启动失败: {}", e);
+        format!("FFmpeg 执行失败: {}", e)
+    })?;
 
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
+        error!("[Video] FFmpeg 提取音频失败: {}", err);
         return Err(format!("FFmpeg 音频提取失败: {}", err));
     }
+
+    info!("[Video] FFmpeg 提取音频成功");
 
     Ok(())
 }
@@ -139,11 +154,16 @@ async fn call_asr_service(audio_path: &Path) -> Result<String, String> {
         .send()
         .await
         .map_err(|e| {
-            format!(
+            let err_msg = format!(
                 "ASR 服务连接失败 ({}): {}。请确保 ASR 服务已启动且模型已下载。",
                 url, e
-            )
+            );
+            error!("[Video] {}", err_msg);
+            err_msg
         })?;
+
+    info!("[Video] ASR 服务响应状态: {}", response.status());
+
 
     // 流式读取 SSE 响应
     let body = response

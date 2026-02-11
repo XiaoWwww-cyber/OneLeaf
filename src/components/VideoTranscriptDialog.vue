@@ -17,9 +17,12 @@ const open = async (filePath: string) => {
     currentVideoPath.value = filePath
 
     try {
+        console.log('[VideoTranscript] Starting transcription for:', filePath)
         const res = await invoke<{text: string}>('transcribe_video', { videoPath: filePath })
+        console.log('[VideoTranscript] Result:', res)
         transcript.value = res.text
     } catch (e) {
+        console.error('[VideoTranscript] Error:', e)
         transcript.value = `转写失败: ${e}`
     } finally {
         loading.value = false
