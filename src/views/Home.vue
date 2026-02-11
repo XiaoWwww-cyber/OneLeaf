@@ -5,7 +5,7 @@ import { open } from '@tauri-apps/plugin-dialog'
 import { ElMessage } from 'element-plus'
 import {
   ChatDotRound, Document, VideoPlay, Position,
-  Plus, Fold, Expand, Delete, FolderOpened
+  Plus, Fold, Expand, Delete
 } from '@element-plus/icons-vue'
 import VideoTranscriptDialog from '../components/VideoTranscriptDialog.vue'
 
@@ -39,6 +39,9 @@ interface KbDoc {
   name: string
   category: string
   content: string
+  source_path: string | null
+  backup_path: string | null
+  file_type: string
 }
 const kbDocuments = ref<KbDoc[]>([])
 const videoDialogRef = ref()
@@ -49,6 +52,45 @@ const selectedDoc = ref<KbDoc | null>(null)
 const showDocDetail = (doc: KbDoc) => {
   selectedDoc.value = doc
   detailDialogVisible.value = true
+}
+
+/** 根据文件类型获取图标名 */
+const getDocIcon = (doc: KbDoc) => {
+  if (doc.category === 'video-transcript') return '🎬'
+  const ft = doc.file_type?.toLowerCase() || ''
+  if (['pdf'].includes(ft)) return '📄'
+  if (['doc', 'docx'].includes(ft)) return '📝'
+  if (['xls', 'xlsx'].includes(ft)) return '📊'
+  if (['txt', 'md'].includes(ft)) return '📃'
+  return '📁'
+}
+
+/** 根据文件类型获取标签名 */
+const getDocTag = (doc: KbDoc) => {
+  if (doc.category === 'video-transcript') return '视频转写'
+  const ft = doc.file_type?.toLowerCase() || ''
+  if (['pdf'].includes(ft)) return 'PDF 文档'
+  if (['doc', 'docx'].includes(ft)) return 'Word 文档'
+  if (['xls', 'xlsx'].includes(ft)) return 'Excel 表格'
+  if (['txt'].includes(ft)) return '文本文件'
+  if (['md'].includes(ft)) return 'Markdown'
+  return '文档'
+}
+
+/** 是否可以用系统程序打开 */
+const canOpenExternal = (doc: KbDoc | null) => {
+  if (!doc) return false
+  const ft = doc.file_type?.toLowerCase() || ''
+  return ['pdf', 'doc', 'docx', 'xls', 'xlsx'].includes(ft)
+}
+
+/** 使用系统默认程序打开文件 */
+const handleOpenFile = async (doc: KbDoc) => {
+  try {
+    await invoke('open_document_file', { id: doc.id })
+  } catch (e) {
+    ElMessage.error(`打开文件失败: ${e}`)
+  }
 }
 
 // ========== 初始化 ==========
@@ -313,7 +355,7 @@ const handleDeleteDoc = async (id: string) => {
             class="kb-item clickable"
             @click="showDocDetail(doc)"
           >
-            <el-icon class="kb-icon"><FolderOpened /></el-icon>
+            <span class="kb-emoji-icon">{{ getDocIcon(doc) }}</span>
             <span class="kb-name" :title="doc.name">{{ doc.name }}</span>
             <el-icon class="kb-delete" @click.stop="handleDeleteDoc(doc.id)">
               <Delete />
@@ -329,15 +371,26 @@ const handleDeleteDoc = async (id: string) => {
     <VideoTranscriptDialog ref="videoDialogRef" @saved="refreshDocuments" />
 
     <!-- 文档详情对话框 -->
-    <el-dialog v-model="detailDialogVisible" :title="selectedDoc?.name || '文档详情'" width="60%">
-      <div class="doc-detail-content">
-        <div class="doc-meta">
-          <el-tag size="small" type="info">{{ selectedDoc?.category === 'video-transcript' ? '视频转写' : '文档' }}</el-tag>
+    <el-dialog v-model="detailDialogVisible" :title="selectedDoc?.name || '文档详情'" width="60%" class="doc-preview-dialog">
+      <div v-if="selectedDoc" class="doc-detail-content">
+        <div class="doc-meta-bar">
+          <el-tag size="small" :type="selectedDoc.category === 'video-transcript' ? 'warning' : 'info'">
+            {{ getDocTag(selectedDoc) }}
+          </el-tag>
+          <el-button
+            v-if="canOpenExternal(selectedDoc)"
+            size="small"
+            type="primary"
+            plain
+            @click="handleOpenFile(selectedDoc)"
+          >
+            用系统程序打开原件
+          </el-button>
         </div>
         <el-input
-          v-model="selectedDoc!.content"
+          :model-value="selectedDoc.content"
           type="textarea"
-          :rows="15"
+          :rows="18"
           readonly
           class="detail-textarea"
         />
@@ -769,7 +822,17 @@ const handleDeleteDoc = async (id: string) => {
   color: #4facfe;
 }
 
-.doc-meta {
+.kb-emoji-icon {
+  font-size: 1rem;
+  flex-shrink: 0;
+  line-height: 1;
+}
+
+/* ========== 文档预览对话框 ========== */
+.doc-meta-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   margin-bottom: 12px;
 }
 
@@ -777,11 +840,9 @@ const handleDeleteDoc = async (id: string) => {
   background-color: #1a1a2e;
   color: #e3e3e3;
   border-color: rgba(255, 255, 255, 0.1);
-}
-
-.kb-icon {
-  color: #4facfe;
-  flex-shrink: 0;
+  font-family: 'Consolas', 'Microsoft YaHei', monospace;
+  font-size: 0.9rem;
+  line-height: 1.65;
 }
 
 .kb-name {

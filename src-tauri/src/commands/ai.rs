@@ -1,6 +1,6 @@
 use crate::ai::knowledge_base::{Document, KnowledgeBase, SearchResult};
 use crate::ai::service::{AiService, ChatMessage};
-// use crate::utils::paths::get_app_paths; // 需要实现 utils::paths
+use crate::utils::paths::get_kb_files_dir;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use std::path::PathBuf;
@@ -44,11 +44,19 @@ pub async fn init_knowledge_base(app: AppHandle, db_path: String) -> Result<(), 
 }
 
 #[tauri::command]
-pub async fn add_document_to_kb(file_path: Option<String>, content: Option<String>, category: String) -> Result<Document, String> {
+pub async fn add_document_to_kb(
+    app: AppHandle,
+    file_path: Option<String>,
+    content: Option<String>,
+    category: String,
+) -> Result<Document, String> {
     let kb = KNOWLEDGE_BASE.lock().as_ref().cloned().ok_or("知识库未初始化")?;
+    let kb_files_dir = get_kb_files_dir(&app);
     
     let path_buf = file_path.map(PathBuf::from);
-    let doc = kb.add_document(path_buf.as_ref(), content, &category).await.map_err(|e| e.to_string())?;
+    let doc = kb.add_document(
+        path_buf.as_ref(), content, &category, Some(&kb_files_dir),
+    ).await.map_err(|e| e.to_string())?;
     Ok(doc)
 }
 
@@ -87,7 +95,7 @@ pub async fn chat_with_ai(messages: Vec<ChatMessage>) -> Result<String, String> 
 
     let mut final_messages = messages.clone();
     if let Some(ctx) = context {
-        let system_prompt = format!("你是一个智能助手。请参考以下知识库内容回答用户问题:\n\n{}", ctx);
+        let system_prompt = format!("你是一个智能助手。请参考以下知识库内容回答用户问题：\n\n{}", ctx);
         final_messages.insert(0, ChatMessage { role: "system".to_string(), content: system_prompt });
     }
 
@@ -105,5 +113,66 @@ pub async fn list_documents() -> Result<Vec<Document>, String> {
 #[tauri::command]
 pub async fn delete_document(id: String) -> Result<(), String> {
     let kb = KNOWLEDGE_BASE.lock().as_ref().cloned().ok_or("知识库未初始化")?;
+    
+    // 获取文档信息（用于删除备份文件）
+    let docs = kb.list_documents().await.map_err(|e| e.to_string())?;
+    if let Some(doc) = docs.iter().find(|d| d.id == id) {
+        // 删除备份文件
+        if let Some(bp) = &doc.backup_path {
+            let _ = std::fs::remove_file(bp);
+        }
+    }
+    
     kb.delete_document(&id).await.map_err(|e| e.to_string())
+}
+
+/// 获取文档内容（用于预览）
+#[tauri::command]
+pub async fn get_document_content(id: String) -> Result<Document, String> {
+    let kb = KNOWLEDGE_BASE.lock().as_ref().cloned().ok_or("知识库未初始化")?;
+    let docs = kb.list_documents().await.map_err(|e| e.to_string())?;
+    docs.into_iter().find(|d| d.id == id).ok_or("文档不存在".to_string())
+}
+
+/// 用系统默认程序打开文档原件
+#[tauri::command]
+pub async fn open_document_file(id: String) -> Result<(), String> {
+    let kb = KNOWLEDGE_BASE.lock().as_ref().cloned().ok_or("知识库未初始化")?;
+    let docs = kb.list_documents().await.map_err(|e| e.to_string())?;
+    let doc = docs.into_iter().find(|d| d.id == id).ok_or("文档不存在".to_string())?;
+    
+    // 优先使用备份路径，其次使用源路径
+    let file_path = doc.backup_path.or(doc.source_path).ok_or("未找到文档文件".to_string())?;
+    
+    let path = PathBuf::from(&file_path);
+    if !path.exists() {
+        return Err(format!("文件不存在: {}", file_path));
+    }
+    
+    // 使用系统默认程序打开
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", &file_path])
+            .spawn()
+            .map_err(|e| format!("打开文件失败: {}", e))?;
+    }
+    
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&file_path)
+            .spawn()
+            .map_err(|e| format!("打开文件失败: {}", e))?;
+    }
+    
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&file_path)
+            .spawn()
+            .map_err(|e| format!("打开文件失败: {}", e))?;
+    }
+    
+    Ok(())
 }

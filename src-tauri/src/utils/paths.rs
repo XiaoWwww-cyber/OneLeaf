@@ -14,3 +14,8 @@ pub fn get_temp_dir(app: &AppHandle) -> PathBuf {
 pub fn get_models_dir(app: &AppHandle) -> PathBuf {
     get_app_data_dir(app).join("models")
 }
+
+/// 知识库文件备份目录
+pub fn get_kb_files_dir(app: &AppHandle) -> PathBuf {
+    get_app_data_dir(app).join("kb-files")
+}

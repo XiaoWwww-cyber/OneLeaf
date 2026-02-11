@@ -36,7 +36,7 @@ impl VectorDb {
             [],
         )?;
 
-        // 创建文档元数据表 (添加 source_path 字段用于存储源文件路径)
+        // 创建文档元数据表
         conn.execute(
             "CREATE TABLE IF NOT EXISTS documents (
                 id TEXT PRIMARY KEY,
@@ -44,10 +44,16 @@ impl VectorDb {
                 category TEXT NOT NULL,
                 content TEXT NOT NULL,
                 source_path TEXT,
+                backup_path TEXT,
+                file_type TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL
             )",
             [],
         )?;
+
+        // 数据库迁移：为旧表添加新列（如果不存在）
+        let _ = conn.execute("ALTER TABLE documents ADD COLUMN backup_path TEXT", []);
+        let _ = conn.execute("ALTER TABLE documents ADD COLUMN file_type TEXT NOT NULL DEFAULT ''", []);
 
         // 创建索引以加速搜索
         conn.execute(
@@ -61,19 +67,22 @@ impl VectorDb {
     }
 
     /// 保存文档元数据
-    pub fn save_document(&self, id: &str, name: &str, category: &str, content: &str, source_path: Option<&str>, created_at: &str) -> Result<(), VectorDbError> {
+    pub fn save_document(
+        &self, id: &str, name: &str, category: &str, content: &str,
+        source_path: Option<&str>, backup_path: Option<&str>, file_type: &str, created_at: &str,
+    ) -> Result<(), VectorDbError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR REPLACE INTO documents (id, name, category, content, source_path, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![id, name, category, content, source_path, created_at],
+            "INSERT OR REPLACE INTO documents (id, name, category, content, source_path, backup_path, file_type, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![id, name, category, content, source_path, backup_path, file_type, created_at],
         ).map_err(|e| VectorDbError::InsertFailed(e.to_string()))?;
         Ok(())
     }
 
     /// 加载所有文档元数据
-    pub fn load_documents(&self) -> Result<Vec<(String, String, String, String, Option<String>, String)>, VectorDbError> {
+    pub fn load_documents(&self) -> Result<Vec<(String, String, String, String, Option<String>, Option<String>, String, String)>, VectorDbError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT id, name, category, content, source_path, created_at FROM documents")?;
+        let mut stmt = conn.prepare("SELECT id, name, category, content, source_path, backup_path, file_type, created_at FROM documents")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -81,7 +90,9 @@ impl VectorDb {
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, Option<String>>(4)?,
-                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, String>(6).unwrap_or_default(),
+                row.get::<_, String>(7)?,
             ))
         })?;
         

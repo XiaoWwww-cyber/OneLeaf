@@ -36,6 +36,10 @@ pub struct Document {
     pub category: String,
     pub content: String,
     pub source_path: Option<String>,
+    /// 知识库目录中的备份文件路径
+    pub backup_path: Option<String>,
+    /// 文件类型 (txt, md, docx, pdf, mp4, etc.)
+    pub file_type: String,
     pub created_at: String,
 }
 
@@ -116,13 +120,15 @@ impl KnowledgeBase {
         // 从数据库加载已保存的文档
         if let Ok(saved_docs) = vector_db.load_documents() {
             let mut docs = documents.write();
-            for (id, name, category, content, source_path, created_at) in saved_docs {
+            for (id, name, category, content, source_path, backup_path, file_type, created_at) in saved_docs {
                 docs.push(Document {
                     id,
                     name,
                     category,
                     content,
                     source_path,
+                    backup_path,
+                    file_type,
                     created_at,
                 });
             }
@@ -138,66 +144,95 @@ impl KnowledgeBase {
 
     /// 添加文档到知识库
     /// 
-    /// 如果 content 不为空，直接使用 content 作为文档内容 (例如从视频转写的文本)
-    /// 如果 content 为空且 path 存在，则尝试解析文件内容
-    pub async fn add_document(&self, path: Option<&PathBuf>, content: Option<String>, category: &str) -> Result<Document, KbError> {
-        // 确定文档内容和名称
-        let (final_content, name, source_path) = if let Some(p) = path {
+    /// - `path`: 源文件路径（可选）
+    /// - `content`: 直接提供的文本内容（可选，如视频转写文本）
+    /// - `category`: 分类（documents, video-transcript 等）
+    /// - `backup_dir`: 知识库备份目录（可选），用于备份原始文件
+    pub async fn add_document(
+        &self, path: Option<&PathBuf>, content: Option<String>,
+        category: &str, backup_dir: Option<&PathBuf>,
+    ) -> Result<Document, KbError> {
+        let doc_id = Uuid::new_v4().to_string();
+
+        // 确定文档内容、名称、源路径、文件类型
+        let (final_content, name, source_path, file_type) = if let Some(p) = path {
             if !p.exists() && content.is_none() {
                 return Err(KbError::DocumentNotFound(p.display().to_string()));
             }
-            
-            let parsed_content = if let Some(c) = content {
-                c
-            } else {
-                self.parse_document(p)?
-            };
-
-            let file_name = p
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
-                .to_string();
-                
-            (parsed_content, file_name, Some(p.to_string_lossy().to_string()))
+            let parsed_content = if let Some(c) = content { c } else { self.parse_document(p)? };
+            let file_name = p.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
+            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+            (parsed_content, file_name, Some(p.to_string_lossy().to_string()), ext)
         } else if let Some(c) = content {
-            (c, "Text Snippet".to_string(), None)
+            let ft = if category == "video-transcript" { "mp4".to_string() } else { "txt".to_string() };
+            (c, "视频转写文本".to_string(), None, ft)
         } else {
             return Err(KbError::ParseFailed("必须提供文件路径或内容".to_string()));
         };
 
-        // 生成文档 ID
-        let doc_id = Uuid::new_v4().to_string();
+        // 备份原始文件到知识库目录
+        let backup_path = if let Some(bdir) = backup_dir {
+            std::fs::create_dir_all(bdir).ok();
+            if let Some(p) = path {
+                if p.exists() {
+                    // 备份原始文件  
+                    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("bin");
+                    let backup_name = format!("{}_{}", &doc_id[..8], 
+                        p.file_name().and_then(|n| n.to_str()).unwrap_or("file"));
+                    let backup_file = bdir.join(&backup_name);
+                    std::fs::copy(p, &backup_file).ok();
+                    
+                    // 如果是视频类型，额外保存转写文本
+                    if category == "video-transcript" {
+                        let txt_name = format!("{}_{}.txt", &doc_id[..8], 
+                            p.file_stem().and_then(|n| n.to_str()).unwrap_or("video"));
+                        let txt_file = bdir.join(&txt_name);
+                        std::fs::write(&txt_file, &final_content).ok();
+                    }
+                    
+                    Some(backup_file.to_string_lossy().to_string())
+                } else {
+                    // 没有源文件，只保存文本
+                    let txt_name = format!("{}_transcript.txt", &doc_id[..8]);
+                    let txt_file = bdir.join(&txt_name);
+                    std::fs::write(&txt_file, &final_content).ok();
+                    Some(txt_file.to_string_lossy().to_string())
+                }
+            } else {
+                // 纯文本（如视频转写），保存为 txt 文件
+                let txt_name = format!("{}_transcript.txt", &doc_id[..8]);
+                let txt_file = bdir.join(&txt_name);
+                std::fs::write(&txt_file, &final_content).ok();
+                Some(txt_file.to_string_lossy().to_string())
+            }
+        } else {
+            None
+        };
 
         // 生成向量嵌入
         let embedding = self.embedder.embed(&final_content)?;
-
-        // 保存向量到数据库
         self.vector_db.insert(&doc_id, &embedding)?;
 
-        // 创建文档对象
         let doc = Document {
             id: doc_id,
             name,
             category: category.to_string(),
             content: final_content,
             source_path,
+            backup_path,
+            file_type,
             created_at: Utc::now().to_rfc3339(),
         };
 
         // 保存文档元数据到数据库
         self.vector_db.save_document(
-            &doc.id, 
-            &doc.name, 
-            &doc.category, 
-            &doc.content, 
-            doc.source_path.as_deref(), 
-            &doc.created_at
+            &doc.id, &doc.name, &doc.category, &doc.content,
+            doc.source_path.as_deref(), doc.backup_path.as_deref(),
+            &doc.file_type, &doc.created_at,
         )?;
 
         // 保存到内存中
         self.documents.write().push(doc.clone());
-
         Ok(doc)
     }
 

@@ -55,6 +55,8 @@ pub fn run() {
             commands::ai::chat_with_ai,
             commands::ai::list_documents,
             commands::ai::delete_document,
+            commands::ai::get_document_content,
+            commands::ai::open_document_file,
             commands::asr::check_asr_model,
             commands::asr::download_asr_model,
             commands::video::upload_video,

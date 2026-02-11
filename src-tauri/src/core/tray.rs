@@ -3,7 +3,7 @@
 use tauri::{
     tray::{TrayIconBuilder, TrayIconEvent, MouseButton, MouseButtonState},
     menu::{Menu, MenuItem, PredefinedMenuItem},
-    Manager, AppHandle, Emitter,
+    Manager, AppHandle,
     WebviewWindowBuilder, WebviewUrl,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
