@@ -57,10 +57,12 @@ def get_models_dir() -> Path:
         return Path(os.environ["ASR_MODELS_DIR"])
     
     if sys.platform == "win32":
-        # 使用 Roaming AppData 目录
         app_data = Path(os.environ.get("APPDATA", ""))
-        return app_data / "DouyinCreatorToolkit" / "models" / "asr" / "sense-voice"
-        return Path.home() / ".local" / "share" / "DouyinCreatorToolkit" / "models" / "asr" / "sense-voice"
+        res = app_data / "com.oneleaf.app" / "models" / "asr" / "sense-voice"
+    else:
+        res = Path.home() / ".local" / "share" / "com.oneleaf.app" / "models" / "asr" / "sense-voice"
+    print(f"[ASR-GPU] Resolved model dir: {res}")
+    return res
 
 print(f"[ASR-GPU] Server Starting...", flush=True)
 model_dir = get_models_dir()
@@ -94,14 +96,30 @@ def detect_gpu() -> tuple:
                 # 优先选择 NVIDIA 或 AMD 独立显卡
                 for i, gpu in enumerate(lines):
                     if "NVIDIA" in gpu.upper() or "AMD" in gpu.upper() or "RADEON" in gpu.upper():
-                        print(f"[ASR-GPU] 检测到独立显卡: {gpu} (索引: {i})")
+                        print(f"[ASR-GPU] Detected discrete GPU: {gpu} (index: {i})")
                         return True, gpu, i
-                # 如果没有独立显卡，返回第一个
                 return True, lines[0], 0
     except Exception as e:
-        print(f"[ASR-GPU] GPU 检测失败: {e}")
+        print(f"[ASR-GPU] GPU detection failed: {e}")
     
     return False, None, 0
+
+# DLL 路径处理 (针对 Windows)
+if sys.platform == "win32":
+    try:
+        # 寻找 bundled DLLs
+        # 假设 DLLs 在 ../bin 目录下 (相对于 asr_service 脚本)
+        script_dir = Path(__file__).parent
+        bin_dir = (script_dir / ".." / "bin").resolve()
+        if bin_dir.exists():
+            print(f"[ASR-GPU] Adding DLL directory: {bin_dir}")
+            if hasattr(os, "add_dll_directory"):
+                os.add_dll_directory(str(bin_dir))
+            else:
+                os.environ["PATH"] = str(bin_dir) + os.pathsep + os.environ["PATH"]
+    except Exception as e:
+        print(f"[ASR-GPU] Failed to add DLL directory: {e}")
+
 
 def stream_decode_wav(audio_path: str, chunk_duration_s: int = 30):
     """
