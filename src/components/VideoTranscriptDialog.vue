@@ -29,6 +29,8 @@ const open = async (filePath: string) => {
     }
 }
 
+const emit = defineEmits(['saved'])
+
 const handleSave = async () => {
     try {
         await invoke('add_document_to_kb', { 
@@ -38,6 +40,7 @@ const handleSave = async () => {
         })
         ElMessage.success('已保存到知识库')
         visible.value = false
+        emit('saved')
     } catch (e: any) {
         ElMessage.error(`保存失败: ${e}`)
     }

@@ -38,9 +38,18 @@ interface KbDoc {
   id: string
   name: string
   category: string
+  content: string
 }
 const kbDocuments = ref<KbDoc[]>([])
 const videoDialogRef = ref()
+
+const detailDialogVisible = ref(false)
+const selectedDoc = ref<KbDoc | null>(null)
+
+const showDocDetail = (doc: KbDoc) => {
+  selectedDoc.value = doc
+  detailDialogVisible.value = true
+}
 
 // ========== 初始化 ==========
 onMounted(async () => {
@@ -301,7 +310,8 @@ const handleDeleteDoc = async (id: string) => {
           <div
             v-for="doc in kbDocuments"
             :key="doc.id"
-            class="kb-item"
+            class="kb-item clickable"
+            @click="showDocDetail(doc)"
           >
             <el-icon class="kb-icon"><FolderOpened /></el-icon>
             <span class="kb-name" :title="doc.name">{{ doc.name }}</span>
@@ -316,7 +326,26 @@ const handleDeleteDoc = async (id: string) => {
       </div>
     </aside>
 
-    <VideoTranscriptDialog ref="videoDialogRef" />
+    <VideoTranscriptDialog ref="videoDialogRef" @saved="refreshDocuments" />
+
+    <!-- 文档详情对话框 -->
+    <el-dialog v-model="detailDialogVisible" :title="selectedDoc?.name || '文档详情'" width="60%">
+      <div class="doc-detail-content">
+        <div class="doc-meta">
+          <el-tag size="small" type="info">{{ selectedDoc?.category === 'video-transcript' ? '视频转写' : '文档' }}</el-tag>
+        </div>
+        <el-input
+          v-model="selectedDoc!.content"
+          type="textarea"
+          :rows="15"
+          readonly
+          class="detail-textarea"
+        />
+      </div>
+      <template #footer>
+        <el-button @click="detailDialogVisible = false">关闭</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -729,6 +758,25 @@ const handleDeleteDoc = async (id: string) => {
 
 .kb-item:hover {
   background: rgba(255,255,255,0.05);
+}
+
+.kb-item.clickable {
+  cursor: pointer;
+}
+
+.kb-item.clickable:hover {
+  background: rgba(79, 172, 254, 0.1);
+  color: #4facfe;
+}
+
+.doc-meta {
+  margin-bottom: 12px;
+}
+
+.detail-textarea :deep(.el-textarea__inner) {
+  background-color: #1a1a2e;
+  color: #e3e3e3;
+  border-color: rgba(255, 255, 255, 0.1);
 }
 
 .kb-icon {
