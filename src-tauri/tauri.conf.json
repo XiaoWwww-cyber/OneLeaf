@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "oneleaf",
+  "productName": "OneLeaf",
   "version": "0.1.0",
   "identifier": "com.oneleaf.app",
   "build": {
@@ -12,9 +12,13 @@
   "app": {
     "windows": [
       {
-        "title": "oneleaf",
-        "width": 800,
-        "height": 600
+        "label": "main",
+        "title": "OneLeaf - 智能知识库",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 600,
+        "center": true
       }
     ],
     "security": {
@@ -30,6 +34,15 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
+    ],
+    "resources": [
+      "resources/python-embed",
+      "resources/ffmpeg",
+      "resources/asr-service",
+      "resources/bin/DirectML.dll",
+      "resources/bin/onnxruntime.dll",
+      "resources/bin/sherpa-onnx-c-api.dll",
+      "resources/bin/sherpa-onnx-cxx-api.dll"
     ]
   }
 }
