@@ -3,7 +3,7 @@ import { ref, onMounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { ElMessage } from 'element-plus'
-import { Download, Check, Loading } from '@element-plus/icons-vue'
+import { Download, Loading } from '@element-plus/icons-vue'
 
 // ========== ASR 模型状态 ==========
 interface AsrModelStatus {
