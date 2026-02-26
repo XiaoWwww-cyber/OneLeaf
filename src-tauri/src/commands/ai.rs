@@ -194,7 +194,7 @@ pub async fn chat_with_ai(
 
             if let Some(results) = results {
                 // 相似度阈值过滤：低于 0.6 的结果直接丢弃，避免"矮子里拔将军"
-                let threshold = 0.60_f32;
+                let threshold = 0.50_f32;
                 let filtered: Vec<_> = results
                     .into_iter()
                     .filter(|r| {
@@ -213,7 +213,7 @@ pub async fn chat_with_ai(
                         .iter()
                         .map(|r| {
                             info!("有效匹配: {} (相关度: {})", r.document.name, r.relevance);
-                            format!("【{}】{}", r.document.name, r.snippet)
+                            format!("【{}】{}", r.document.name, r.document.content)
                         })
                         .collect::<Vec<_>>()
                         .join("\n\n");
@@ -614,6 +614,33 @@ pub async fn get_ai_settings() -> Result<AiSettings, String> {
 pub async fn check_lm_studio() -> Result<bool, String> {
     let service = AI_SERVICE.lock().clone();
     Ok(service.check_lm_studio().await)
+}
+
+/// 清除所有缓存（知识库 + 聊天记录 + 备份文件）
+#[tauri::command]
+pub async fn clear_all_cache(app: AppHandle) -> Result<(), String> {
+    info!("开始清除所有缓存...");
+
+    // 1. 清除数据库数据（知识库 + 聊天记录）
+    let kb = KNOWLEDGE_BASE.lock().as_ref().cloned();
+    if let Some(kb) = kb {
+        kb.clear_all_with_history().await.map_err(|e| format!("清除数据库失败: {}", e))?;
+        info!("数据库清除完成");
+    }
+
+    // 2. 清除 kb-files 备份目录
+    let kb_files_dir = get_kb_files_dir(&app);
+    if kb_files_dir.exists() {
+        if let Err(e) = std::fs::remove_dir_all(&kb_files_dir) {
+            warn!("清除备份文件目录失败: {}", e);
+        } else {
+            info!("备份文件目录清除完成: {:?}", kb_files_dir);
+        }
+    }
+
+    info!("所有缓存清除完成");
+    let _ = app.emit("cache-cleared", ());
+    Ok(())
 }
 
 #[tauri::command]

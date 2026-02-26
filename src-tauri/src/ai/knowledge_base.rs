@@ -158,7 +158,7 @@ impl KnowledgeBase {
                 for (id, name, category, content, source_path, backup_path, file_type, created_at) in saved_docs {
                     let doc = Document {
                         id: id.clone(),
-                        name,
+                        name: name.clone(),
                         category,
                         content: content.clone(),
                         source_path,
@@ -168,7 +168,7 @@ impl KnowledgeBase {
                     };
                     
                     if needs_reembed {
-                        docs_to_reembed.push((id, content));
+                        docs_to_reembed.push((id, name, content));
                     }
                     
                     // 确保都在全文索引中（启动时轻量同步）
@@ -185,8 +185,9 @@ impl KnowledgeBase {
 
         // 如果需要重建向量
         if needs_reembed {
-            for (id, content) in docs_to_reembed {
-                if let Ok(embedding) = embedder.embed(&content) {
+            for (id, name, content) in docs_to_reembed {
+                let embed_text = format!("【{}】\n{}", name, content);
+                if let Ok(embedding) = embedder.embed(&embed_text) {
                     let _ = vector_db.insert(&id, &embedding);
                     tracing::info!("♻️ 已为文档 {} 重新生成维度为 {} 的向量", id, current_dim);
                 }
@@ -272,8 +273,9 @@ impl KnowledgeBase {
             None
         };
 
-        // 生成向量嵌入
-        let embedding = self.embedder.embed(&final_content)?;
+        // 生成向量嵌入（注入文件名元数据，提升按文件名搜索的匹配度）
+        let embed_text = format!("【{}】\n{}", name, final_content);
+        let embedding = self.embedder.embed(&embed_text)?;
         self.vector_db.insert(&doc_id, &embedding)?;
 
         let doc = Document {
@@ -351,6 +353,16 @@ impl KnowledgeBase {
     /// 清除所有数据
     pub async fn clear_all(&self) -> Result<(), KbError> {
         self.vector_db.clear_all()?;
+        if let Err(e) = self.tantivy_index.clear_all() {
+            tracing::warn!("Tantivy 索引清除失败（非致命）: {}", e);
+        }
+        self.documents.write().clear();
+        Ok(())
+    }
+
+    /// 清除所有数据（包括知识库和聊天记录）
+    pub async fn clear_all_with_history(&self) -> Result<(), KbError> {
+        self.vector_db.clear_all_with_history()?;
         if let Err(e) = self.tantivy_index.clear_all() {
             tracing::warn!("Tantivy 索引清除失败（非致命）: {}", e);
         }

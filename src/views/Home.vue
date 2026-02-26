@@ -110,7 +110,7 @@ const attachedFiles = ref<ChatAttachment[]>([])
 const handleChatUploadFile = async () => {
   const selected = await open({
     multiple: false,
-    filters: [{ name: '文档', extensions: ['pdf', 'txt', 'md'] }]
+    filters: [{ name: '文档', extensions: ['pdf', 'txt', 'md', 'doc', 'docx'] }]
   })
   if (!selected || Array.isArray(selected)) return
   const filePath = selected
@@ -328,6 +328,17 @@ onMounted(async () => {
   listen<string>('ai-provider-changed', (event) => {
     console.log('AI provider changed:', event.payload)
     currentAiProvider.value = event.payload || ''
+  })
+
+  // 监听缓存清除事件，刷新前端状态
+  listen('cache-cleared', () => {
+    kbDocuments.value = []
+    conversations.value = []
+    messages.value = []
+    activeConversationId.value = ''
+    searchQuery.value = ''
+    searchResults.value = []
+    hasSearched.value = false
   })
 
   await refreshDocuments()

@@ -398,6 +398,17 @@ impl VectorDb {
         Ok(())
     }
 
+    /// 清除所有数据（包括知识库和聊天记录）
+    pub fn clear_all_with_history(&self) -> Result<(), VectorDbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM document_vectors", [])?;
+        conn.execute("DELETE FROM documents", [])?;
+        conn.execute("DELETE FROM conversations", [])?;
+        conn.execute("DELETE FROM messages", [])?;
+        conn.execute("DELETE FROM message_vectors", [])?;
+        Ok(())
+    }
+
     fn f32_slice_to_bytes(&self, slice: &[f32]) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(slice.len() * 4);
         for &value in slice {

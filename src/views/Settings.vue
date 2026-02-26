@@ -2,8 +2,10 @@
 import { ref, onMounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
-import { ElMessage } from 'element-plus'
-import { Download, Loading } from '@element-plus/icons-vue'
+
+import { openPath } from '@tauri-apps/plugin-opener'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { Download, Loading, Delete } from '@element-plus/icons-vue'
 
 // ========== ASR 模型状态 ==========
 interface AsrModelStatus {
@@ -71,6 +73,7 @@ onMounted(async () => {
   await checkAsrModel()
   await checkEmbeddingModel()
   await loadAiSettings()
+  await loadLogInfo()
 
   listen<any>('model-download-progress', (event) => {
     const d = event.payload
@@ -191,6 +194,94 @@ const saveAiSettings = async () => {
   }
 }
 
+// ========== 缓存清除 ==========
+const clearing = ref(false)
+
+const handleClearCache = async () => {
+  try {
+    await ElMessageBox.confirm(
+      '此操作将清除所有知识库文档、搜索索引和聊天历史记录，且不可恢复。确定要继续吗？',
+      '清除所有缓存',
+      {
+        confirmButtonText: '确认清除',
+        cancelButtonText: '取消',
+        type: 'warning',
+        confirmButtonClass: 'el-button--danger',
+      }
+    )
+  } catch {
+    return // 用户取消
+  }
+
+  clearing.value = true
+  try {
+    await invoke('clear_all_cache')
+    ElMessage.success('所有缓存已清除')
+  } catch (e) {
+    ElMessage.error(`清除失败: ${e}`)
+  } finally {
+    clearing.value = false
+  }
+}
+
+// ========== 日志管理 ==========
+interface LogFileInfo {
+  name: string
+  size_bytes: number
+}
+interface LogInfo {
+  log_dir: string
+  files: LogFileInfo[]
+  total_size_mb: number
+}
+
+const logInfo = ref<LogInfo | null>(null)
+const logLoading = ref(false)
+const logClearing = ref(false)
+
+const loadLogInfo = async () => {
+  logLoading.value = true
+  try {
+    logInfo.value = await invoke<LogInfo>('get_log_info')
+  } catch (e) {
+    console.warn('加载日志信息失败:', e)
+  } finally {
+    logLoading.value = false
+  }
+}
+
+const handleClearLogs = async () => {
+  try {
+    await ElMessageBox.confirm(
+      '确定要删除所有日志文件吗？',
+      '清除日志',
+      {
+        confirmButtonText: '确认删除',
+        cancelButtonText: '取消',
+        type: 'warning',
+      }
+    )
+  } catch {
+    return
+  }
+
+  logClearing.value = true
+  try {
+    await invoke('clear_logs')
+    ElMessage.success('日志已清除')
+    await loadLogInfo()
+  } catch (e) {
+    ElMessage.error(`清除失败: ${e}`)
+  } finally {
+    logClearing.value = false
+  }
+}
+
+const formatSize = (mb: number): string => {
+  if (mb < 1) return `${(mb * 1024).toFixed(1)} KB`
+  return `${mb.toFixed(2)} MB`
+}
+
 const checkLmStudio = async () => {
   lmStudioChecking.value = true
   try {
@@ -205,6 +296,16 @@ const checkLmStudio = async () => {
     ElMessage.error('检测失败')
   } finally {
     lmStudioChecking.value = false
+  }
+}
+
+// ========== 打开本地目录 ==========
+const openDirectory = async (path: string | undefined) => {
+  if (!path) return
+  try {
+    await openPath(path)
+  } catch (e) {
+    ElMessage.error(`打开目录失败: ${e}`)
   }
 }
 </script>
@@ -330,20 +431,25 @@ const checkLmStudio = async () => {
           </template>
         </div>
 
-        <div class="card-footer">
-          <template v-if="embeddingStatus?.is_installed">
-            <span class="model-dir" :title="embeddingStatus?.model_dir">
-              📂 {{ embeddingStatus?.model_dir }}
-            </span>
-          </template>
-          <template v-else>
-            <el-button type="primary" :loading="embeddingDownloading" @click="handleDownloadEmbedding">
-              <el-icon v-if="!embeddingDownloading">
-                <Download />
-              </el-icon>
-              {{ embeddingDownloading ? '下载中...' : '下载模型' }}
-            </el-button>
-          </template>
+        <div class="card-footer" style="justify-content: space-between;">
+          <div class="footer-left">
+            <template v-if="embeddingStatus?.is_installed">
+              <span class="model-dir clickable" :title="embeddingStatus?.model_dir"
+                @click="openDirectory(embeddingStatus?.model_dir)">
+                📂 {{ embeddingStatus?.model_dir }}
+              </span>
+            </template>
+          </div>
+          <div c？lass="footer-right">
+            <template v-if="!embeddingStatus?.is_installed">
+              <el-button type="primary" :loading="embeddingDownloading" @click="handleDownloadEmbedding">
+                <el-icon v-if="!embeddingDownloading">
+                  <Download />
+                </el-icon>
+                {{ embeddingDownloading ? '下载中...' : '下载模型' }}
+              </el-button>
+            </template>
+          </div>
         </div>
       </div>
 
@@ -394,20 +500,92 @@ const checkLmStudio = async () => {
           </template>
         </div>
 
-        <div class="card-footer">
-          <template v-if="asrStatus?.is_installed">
-            <span class="model-dir" :title="asrStatus?.model_dir">
-              📂 {{ asrStatus?.model_dir }}
-            </span>
-          </template>
-          <template v-else>
-            <el-button type="primary" :loading="asrDownloading" @click="handleDownloadAsr">
-              <el-icon v-if="!asrDownloading">
-                <Download />
+        <div class="card-footer" style="justify-content: space-between;">
+          <div class="footer-left">
+            <template v-if="asrStatus?.is_installed">
+              <span class="model-dir clickable" :title="asrStatus?.model_dir"
+                @click="openDirectory(asrStatus?.model_dir)">
+                📂 {{ asrStatus?.model_dir }}
+              </span>
+            </template>
+          </div>
+          <div class="footer-right">
+            <template v-if="!asrStatus?.is_installed">
+              <el-button type="primary" :loading="asrDownloading" @click="handleDownloadAsr">
+                <el-icon v-if="!asrDownloading">
+                  <Download />
+                </el-icon>
+                {{ asrDownloading ? '下载中...' : '下载模型' }}
+              </el-button>
+            </template>
+          </div>
+        </div>
+      </div>
+
+      <!-- ====== 数据管理 ====== -->
+      <div class="settings-card">
+        <div class="card-header">
+          <div class="card-icon danger">🗑️</div>
+          <div>
+            <h2>数据管理</h2>
+            <p>管理本地缓存数据</p>
+          </div>
+        </div>
+        <div class="card-body">
+          <div class="danger-zone">
+            <div class="danger-info">
+              <span class="danger-title">清除所有缓存</span>
+              <span class="danger-desc">删除知识库文档、搜索索引、向量数据和所有聊天历史记录</span>
+            </div>
+            <el-button type="danger" :loading="clearing" @click="handleClearCache">
+              <el-icon v-if="!clearing">
+                <Delete />
               </el-icon>
-              {{ asrDownloading ? '下载中...' : '下载模型' }}
+              {{ clearing ? '清除中...' : '清除所有缓存' }}
             </el-button>
-          </template>
+          </div>
+        </div>
+      </div>
+
+      <!-- ====== 日志管理 ====== -->
+      <div class="settings-card">
+        <div class="card-header">
+          <div class="card-icon log">📋</div>
+          <div>
+            <h2>日志管理</h2>
+            <p>查看和管理应用运行日志</p>
+          </div>
+        </div>
+        <div class="card-body">
+          <div v-if="logInfo" class="log-info">
+            <div class="about-row">
+              <span>日志目录</span>
+              <span class="log-path clickable" :title="logInfo.log_dir" @click="openDirectory(logInfo.log_dir)">{{
+                logInfo.log_dir }}</span>
+            </div>
+            <div class="about-row">
+              <span>日志文件数</span>
+              <span>{{ logInfo.files.length }} 个</span>
+            </div>
+            <div class="about-row">
+              <span>总大小</span>
+              <span>{{ formatSize(logInfo.total_size_mb) }}</span>
+            </div>
+          </div>
+          <div v-else class="status-loading">
+            <el-icon class="is-loading">
+              <Loading />
+            </el-icon>
+            <span>加载中...</span>
+          </div>
+        </div>
+        <div class="card-footer">
+          <el-button :loading="logClearing" type="danger" plain @click="handleClearLogs">
+            <el-icon v-if="!logClearing">
+              <Delete />
+            </el-icon>
+            {{ logClearing ? '清除中...' : '清除日志' }}
+          </el-button>
         </div>
       </div>
 
@@ -505,6 +683,56 @@ const checkLmStudio = async () => {
 
 .card-icon.about {
   background: rgba(79, 172, 254, 0.12);
+}
+
+.card-icon.danger {
+  background: rgba(244, 63, 94, 0.12);
+}
+
+.card-icon.log {
+  background: rgba(251, 191, 36, 0.12);
+}
+
+.log-path {
+  font-size: 0.75rem;
+  color: #4facfe;
+  max-width: 300px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.clickable {
+  cursor: pointer;
+}
+
+.clickable:hover {
+  text-decoration: underline;
+  opacity: 0.8;
+}
+
+.danger-zone {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.danger-info {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.danger-title {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: #e3e3e3;
+}
+
+.danger-desc {
+  font-size: 0.78rem;
+  color: #888;
 }
 
 .card-header h2 {
