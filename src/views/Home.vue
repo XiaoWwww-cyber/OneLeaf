@@ -994,7 +994,7 @@ const handleDeleteDoc = async (id: string) => {
 }
 
 .tool-btn {
-  font-size: 1.15rem;
+  font-size: 1.6rem;
   color: #888;
   cursor: pointer;
   padding: 6px;
@@ -1023,7 +1023,7 @@ const handleDeleteDoc = async (id: string) => {
 }
 
 .send-btn {
-  font-size: 1.2rem;
+  font-size: 1.6rem;
   color: #555;
   cursor: pointer;
   padding: 6px;
