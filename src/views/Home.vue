@@ -35,6 +35,7 @@ interface Message {
   content: string
   thinking?: string
   answer?: string
+  thinkingDone?: boolean
 }
 const messages = ref<Message[]>([])
 const inputText = ref('')
@@ -179,7 +180,8 @@ const parseMessage = (msg: { role: string, content: string, id?: string }): Mess
     return {
       ...base,
       thinking: match[1].trim(),
-      answer: msg.content.replace(thinkRegex, '').trim()
+      answer: msg.content.replace(thinkRegex, '').trim(),
+      thinkingDone: true,
     }
   }
   return { ...base, answer: msg.content }
@@ -322,6 +324,12 @@ onMounted(async () => {
     console.warn('load ai settings:', e)
   }
 
+  // 监听后端 provider 切换事件，实时同步
+  listen<string>('ai-provider-changed', (event) => {
+    console.log('AI provider changed:', event.payload)
+    currentAiProvider.value = event.payload || ''
+  })
+
   await refreshDocuments()
 })
 
@@ -426,6 +434,10 @@ const handleSend = async () => {
       streamFullText += chunk.delta
       msgProxy.answer = streamFullText
       msgProxy.content = (streamThinking ? `<think>${streamThinking}</think>\n\n` : '') + streamFullText
+      // 收到第一个正文 chunk 时，折叠思考面板
+      if (!msgProxy.thinkingDone && streamThinking) {
+        msgProxy.thinkingDone = true
+      }
     } else if (chunk.chunk_type === 'thinking') {
       streamThinking += chunk.delta
       msgProxy.thinking = streamThinking
@@ -724,9 +736,9 @@ const handleDeleteDoc = async (id: string) => {
             <div class="message-bubble">
               <div class="message-content">
                 <template v-if="msg.role === 'assistant'">
-                  <Thinking v-if="msg.thinking" status="end" :model-value="false" :content="msg.thinking"
-                    button-width="180px" max-width="100%" background-color="#2a2a2a" color="#d1d1d1"
-                    style="margin-bottom: 8px;" />
+                  <Thinking v-if="msg.thinking" :status="msg.thinkingDone ? 'end' : 'thinking'"
+                    :model-value="!msg.thinkingDone" :content="msg.thinking" button-width="180px" max-width="100%"
+                    background-color="#2a2a2a" color="#d1d1d1" style="margin-bottom: 8px;" />
                   <div class="answer-text markdown-body" v-html="renderMarkdown(msg.answer || msg.content)"></div>
                 </template>
                 <template v-else>{{ msg.answer || msg.content }}</template>

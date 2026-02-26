@@ -108,18 +108,23 @@ pub async fn search_knowledge_base(query: String, limit: usize) -> Result<Vec<Se
 pub async fn upload_file_to_ai(file_path: String) -> Result<String, String> {
     info!("上传文件到 AI: {}", file_path);
     let service = AI_SERVICE.lock().clone();
-    
-    // 如果是本地模型，不支持远端上传，返回带标识的本地路径供组装上下文使用
-    if service.provider_type == crate::ai::service::AiProviderType::LmStudio {
-        info!("当前为本地模型，使用本地文本提取策略: {}", file_path);
-        // 先简单测试能否解析，防止对话时才报错
-        let path = std::path::Path::new(&file_path);
+    let path = std::path::Path::new(&file_path);
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+
+    // 可本地提取文本的格式，统一走本地策略（不管是什么 provider）
+    // 云端 API（如豆包）不支持 txt/md/docx 上传
+    let local_text_formats = ["txt", "md", "docx"];
+    let is_local_model = service.provider_type == crate::ai::service::AiProviderType::LmStudio;
+
+    if is_local_model || local_text_formats.contains(&ext.as_str()) {
+        info!("使用本地文本提取策略 (ext={}, local_model={}): {}", ext, is_local_model, file_path);
         if let Err(e) = crate::ai::document_parser::extract_text_from_file(path) {
             return Err(format!("本地文件解析失败: {}", e));
         }
         return Ok(format!("LOCAL_FILE:{}", file_path));
     }
 
+    // PDF/图片/视频等走云端上传
     service
         .upload_file(&file_path)
         .await
@@ -526,6 +531,9 @@ pub async fn update_ai_settings(app: AppHandle, settings: AiSettings) -> Result<
     }
 
     save_ai_settings_to_disk(&app, &settings);
+
+    // 通知前端 provider 已改变
+    let _ = app.emit("ai-provider-changed", &settings.provider);
 
     info!("AI 设置已更新并持久化，提供者: {:?}", provider_type);
     Ok(())
