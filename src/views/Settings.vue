@@ -231,63 +231,40 @@ const checkLmStudio = async () => {
           <div class="form-group">
             <label>AI 提供者</label>
             <el-select v-model="aiSettings.provider" style="width: 100%">
-              <el-option
-                v-for="opt in providerOptions"
-                :key="opt.value"
-                :label="opt.label"
-                :value="opt.value"
-              />
+              <el-option v-for="opt in providerOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
             </el-select>
           </div>
 
           <!-- 豆包 -->
           <div v-if="aiSettings.provider === 'doubao'" class="form-group">
             <label>豆包 API Key</label>
-            <el-input
-              v-model="aiSettings.doubao_api_key"
-              placeholder="输入豆包 API Key"
-              show-password
-            />
+            <el-input v-model="aiSettings.doubao_api_key" placeholder="输入豆包 API Key" show-password />
           </div>
 
           <div v-if="aiSettings.provider === 'doubao'" class="form-group">
             <label>豆包模型名称</label>
-            <el-input
-              v-model="aiSettings.doubao_model_id"
-              placeholder="doubao-seed-2-0-pro-260215"
-            />
-            <p style="font-size: 0.75rem; color: #666; margin-top: 4px;">填写模型名称（如 doubao-seed-2-0-pro-260215）或火山引擎 Ark 推理点 ID（如 ep-xxx）</p>
+            <el-input v-model="aiSettings.doubao_model_id" placeholder="doubao-seed-2-0-pro-260215" />
+            <p style="font-size: 0.75rem; color: #666; margin-top: 4px;">填写模型名称（如 doubao-seed-2-0-pro-260215）或火山引擎 Ark
+              推理点 ID（如 ep-xxx）</p>
           </div>
 
           <!-- OpenAI -->
           <div v-if="aiSettings.provider === 'openai'" class="form-group">
             <label>OpenAI API Key</label>
-            <el-input
-              v-model="aiSettings.openai_api_key"
-              placeholder="输入 OpenAI API Key"
-              show-password
-            />
+            <el-input v-model="aiSettings.openai_api_key" placeholder="输入 OpenAI API Key" show-password />
           </div>
 
           <!-- DeepSeek -->
           <div v-if="aiSettings.provider === 'deepseek'" class="form-group">
             <label>DeepSeek API Key</label>
-            <el-input
-              v-model="aiSettings.deepseek_api_key"
-              placeholder="输入 DeepSeek API Key"
-              show-password
-            />
+            <el-input v-model="aiSettings.deepseek_api_key" placeholder="输入 DeepSeek API Key" show-password />
           </div>
 
           <!-- LM Studio -->
           <div v-if="aiSettings.provider === 'lmstudio'" class="form-group">
             <label>LM Studio 地址</label>
             <div style="display: flex; gap: 8px;">
-              <el-input
-                v-model="aiSettings.lm_studio_url"
-                placeholder="http://localhost:1234"
-                style="flex: 1"
-              />
+              <el-input v-model="aiSettings.lm_studio_url" placeholder="http://localhost:1234" style="flex: 1" />
               <el-button :loading="lmStudioChecking" @click="checkLmStudio">
                 检测
               </el-button>
@@ -318,7 +295,9 @@ const checkLmStudio = async () => {
 
         <div class="card-body">
           <div v-if="embeddingLoading" class="status-loading">
-            <el-icon class="is-loading"><Loading /></el-icon>
+            <el-icon class="is-loading">
+              <Loading />
+            </el-icon>
             <span>检测模型状态...</span>
           </div>
 
@@ -326,8 +305,9 @@ const checkLmStudio = async () => {
             <div class="model-info">
               <div class="model-name">
                 {{ embeddingStatus.name }}
-                <el-tag v-if="embeddingStatus.is_installed" type="success" size="small" effect="dark" round class="status-tag">
-                  <el-icon><Check /></el-icon> <span>已安装</span>
+                <el-tag v-if="embeddingStatus.is_installed" type="success" size="small" effect="dark" round
+                  class="status-tag">
+                  <span>已安装</span>
                 </el-tag>
                 <el-tag v-else type="warning" size="small" effect="dark" round class="status-tag">
                   未安装
@@ -358,7 +338,9 @@ const checkLmStudio = async () => {
           </template>
           <template v-else>
             <el-button type="primary" :loading="embeddingDownloading" @click="handleDownloadEmbedding">
-              <el-icon v-if="!embeddingDownloading"><Download /></el-icon>
+              <el-icon v-if="!embeddingDownloading">
+                <Download />
+              </el-icon>
               {{ embeddingDownloading ? '下载中...' : '下载模型' }}
             </el-button>
           </template>
@@ -377,7 +359,9 @@ const checkLmStudio = async () => {
 
         <div class="card-body">
           <div v-if="asrLoading" class="status-loading">
-            <el-icon class="is-loading"><Loading /></el-icon>
+            <el-icon class="is-loading">
+              <Loading />
+            </el-icon>
             <span>检测模型状态...</span>
           </div>
 
@@ -385,8 +369,9 @@ const checkLmStudio = async () => {
             <div class="model-info">
               <div class="model-name">
                 {{ asrStatus.name }}
-                <el-tag v-if="asrStatus.is_installed" type="success" size="small" effect="dark" round class="status-tag">
-                  <el-icon><Check /></el-icon> <span>已安装</span>
+                <el-tag v-if="asrStatus.is_installed" type="success" size="small" effect="dark" round
+                  class="status-tag">
+                  <span>已安装</span>
                 </el-tag>
                 <el-tag v-else type="warning" size="small" effect="dark" round class="status-tag">
                   未安装
@@ -417,7 +402,9 @@ const checkLmStudio = async () => {
           </template>
           <template v-else>
             <el-button type="primary" :loading="asrDownloading" @click="handleDownloadAsr">
-              <el-icon v-if="!asrDownloading"><Download /></el-icon>
+              <el-icon v-if="!asrDownloading">
+                <Download />
+              </el-icon>
               {{ asrDownloading ? '下载中...' : '下载模型' }}
             </el-button>
           </template>
@@ -481,7 +468,7 @@ const checkLmStudio = async () => {
 
 .settings-card {
   background: #22223a;
-  border: 1px solid rgba(255,255,255,0.06);
+  border: 1px solid rgba(255, 255, 255, 0.06);
   border-radius: 16px;
   overflow: hidden;
 }
@@ -491,7 +478,7 @@ const checkLmStudio = async () => {
   align-items: center;
   gap: 14px;
   padding: 20px 24px;
-  border-bottom: 1px solid rgba(255,255,255,0.04);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
 }
 
 .card-icon {
@@ -504,10 +491,21 @@ const checkLmStudio = async () => {
   font-size: 1.3rem;
 }
 
-.card-icon.ai { background: rgba(79, 172, 254, 0.12); }
-.card-icon.asr { background: rgba(244, 63, 94, 0.12); }
-.card-icon.embedding { background: rgba(167, 139, 250, 0.12); }
-.card-icon.about { background: rgba(79, 172, 254, 0.12); }
+.card-icon.ai {
+  background: rgba(79, 172, 254, 0.12);
+}
+
+.card-icon.asr {
+  background: rgba(244, 63, 94, 0.12);
+}
+
+.card-icon.embedding {
+  background: rgba(167, 139, 250, 0.12);
+}
+
+.card-icon.about {
+  background: rgba(79, 172, 254, 0.12);
+}
 
 .card-header h2 {
   font-size: 0.95rem;
@@ -522,19 +520,23 @@ const checkLmStudio = async () => {
   margin: 2px 0 0;
 }
 
-.card-body { padding: 20px 24px; }
+.card-body {
+  padding: 20px 24px;
+}
 
 .card-footer {
   padding: 14px 24px;
-  background: rgba(255,255,255,0.02);
-  border-top: 1px solid rgba(255,255,255,0.04);
+  background: rgba(255, 255, 255, 0.02);
+  border-top: 1px solid rgba(255, 255, 255, 0.04);
   display: flex;
   align-items: center;
   justify-content: flex-end;
   gap: 10px;
 }
 
-.form-group { margin-bottom: 16px; }
+.form-group {
+  margin-bottom: 16px;
+}
 
 .form-group label {
   display: block;
@@ -543,7 +545,9 @@ const checkLmStudio = async () => {
   margin-bottom: 6px;
 }
 
-.lm-status { margin-top: 8px; }
+.lm-status {
+  margin-top: 8px;
+}
 
 .status-loading {
   display: flex;
@@ -572,14 +576,19 @@ const checkLmStudio = async () => {
   /* height: ; */
   padding: 12px;
   display: inline-flex !important;
-  flex-direction: row; /* 显式指定水平排列 */
+  flex-direction: row;
+  /* 显式指定水平排列 */
   align-items: center;
   justify-content: center;
   gap: 4px;
-  white-space: nowrap; /* 强制禁止换行 */
+  white-space: nowrap;
+  /* 强制禁止换行 */
 }
 
-.model-desc { font-size: 0.82rem; color: #888; }
+.model-desc {
+  font-size: 0.82rem;
+  color: #888;
+}
 
 .model-meta {
   display: flex;
@@ -601,7 +610,7 @@ const checkLmStudio = async () => {
 .download-progress {
   margin-top: 16px;
   padding: 14px;
-  background: rgba(255,255,255,0.03);
+  background: rgba(255, 255, 255, 0.03);
   border-radius: 12px;
 }
 
@@ -625,6 +634,11 @@ const checkLmStudio = async () => {
   font-size: 0.85rem;
 }
 
-.about-row span:first-child { color: #888; }
-.about-row span:last-child { color: #ccc; }
+.about-row span:first-child {
+  color: #888;
+}
+
+.about-row span:last-child {
+  color: #ccc;
+}
 </style>
