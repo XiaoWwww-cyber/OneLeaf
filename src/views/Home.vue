@@ -1,13 +1,16 @@
 <script setup lang="ts">
-import { ref, nextTick, onMounted } from 'vue'
+import { ref, reactive, nextTick, onMounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
 import { ElMessage } from 'element-plus'
 import {
   ChatDotRound, Document, VideoPlay, Position,
-  Plus, Fold, Expand, Delete
+  Plus, Fold, Expand, Delete, Search
 } from '@element-plus/icons-vue'
 import VideoTranscriptDialog from '../components/VideoTranscriptDialog.vue'
+
+// @ts-ignore
+import { Thinking } from 'vue-element-plus-x'
 
 // ========== 侧边栏状态 ==========
 const leftCollapsed = ref(false)
@@ -27,11 +30,41 @@ interface Message {
   id: string
   role: 'user' | 'assistant' | 'system'
   content: string
+  thinking?: string
+  answer?: string
 }
 const messages = ref<Message[]>([])
 const inputText = ref('')
+
 const isLoading = ref(false)
+const loadingMap = reactive<Record<string, boolean>>({})
 const chatAreaRef = ref<HTMLElement>()
+const isWebSearchEnabled = ref(false)
+
+/** 更加鲁棒的解析函数 */
+const parseMessage = (msg: {role: string, content: string, id?: string}): Message => {
+    const base: Message = { 
+        id: msg.id || Date.now().toString(), 
+        role: msg.role as any, 
+        content: msg.content 
+    }
+    if (msg.role !== 'assistant') {
+        return { ...base, answer: msg.content };
+    }
+    
+    // 支持不区分大小写、空格以及转义字符: <think> or &lt;think&gt;
+    const thinkRegex = /(?:<\s*think\s*>|&lt;\s*think\s*&gt;)([\s\S]*?)(?:<\/\s*think\s*>|&lt;\/\s*think\s*&gt;)/i
+    const match = msg.content.match(thinkRegex)
+    
+    if (match) {
+        return {
+            ...base,
+            thinking: match[1].trim(),
+            answer: msg.content.replace(thinkRegex, '').trim()
+        }
+    }
+    return { ...base, answer: msg.content }
+}
 
 // ========== 知识库文档 ==========
 interface KbDoc {
@@ -45,6 +78,49 @@ interface KbDoc {
 }
 const kbDocuments = ref<KbDoc[]>([])
 const videoDialogRef = ref()
+
+// ========== 知识库搜索 ==========
+interface SearchResult {
+  document: KbDoc
+  relevance: number
+  snippet: string
+}
+const searchQuery = ref('')
+const searchResults = ref<SearchResult[]>([])
+const isSearching = ref(false)
+const hasSearched = ref(false)
+
+let searchDebounceTimer: ReturnType<typeof setTimeout> | null = null
+
+const handleSearch = () => {
+  if (searchDebounceTimer) clearTimeout(searchDebounceTimer)
+  if (!searchQuery.value.trim()) {
+    searchResults.value = []
+    hasSearched.value = false
+    return
+  }
+  searchDebounceTimer = setTimeout(async () => {
+    isSearching.value = true
+    hasSearched.value = true
+    try {
+      searchResults.value = await invoke<SearchResult[]>('search_knowledge_base', {
+        query: searchQuery.value.trim(),
+        limit: 10,
+      })
+    } catch (e) {
+      console.warn('搜索失败:', e)
+      searchResults.value = []
+    } finally {
+      isSearching.value = false
+    }
+  }, 300)
+}
+
+const clearSearch = () => {
+  searchQuery.value = ''
+  searchResults.value = []
+  hasSearched.value = false
+}
 
 const detailDialogVisible = ref(false)
 const selectedDoc = ref<KbDoc | null>(null)
@@ -95,11 +171,30 @@ const handleOpenFile = async (doc: KbDoc) => {
 
 // ========== 初始化 ==========
 onMounted(async () => {
+  // 1. 知识库初始化
   try {
     await invoke('init_knowledge_base', { dbPath: '' })
   } catch (e) {
     console.warn('KB init:', e)
   }
+
+  // 2. 恢复本地对话记录
+  try {
+    const storedConvs = await invoke<any[]>('load_conversations')
+    conversations.value = storedConvs.map(c => ({
+      id: c.id,
+      title: c.title,
+      time: new Date(c.updated_at).toLocaleTimeString()
+    }))
+
+    if (conversations.value.length > 0) {
+      const firstConv = conversations.value[0]
+      await switchConversation(firstConv)
+    }
+  } catch (e) {
+    console.warn('加载本地对话失败:', e)
+  }
+
   await refreshDocuments()
 })
 
@@ -110,44 +205,100 @@ const handleSend = async () => {
 
   // 如果没有对话，创建一个
   if (!activeConversationId.value) {
+    const convId = Date.now().toString()
+    const convTitle = text.slice(0, 20) + (text.length > 20 ? '...' : '')
     const conv: Conversation = {
-      id: Date.now().toString(),
-      title: text.slice(0, 20) + (text.length > 20 ? '...' : ''),
+      id: convId,
+      title: convTitle,
       time: new Date().toLocaleTimeString()
     }
+    
+    try {
+      await invoke('save_conversation', { id: convId, title: convTitle })
+    } catch(e) {
+      console.error('保存新会话失败', e)
+    }
+    
     conversations.value.unshift(conv)
     activeConversationId.value = conv.id
+    messages.value = []
   }
 
-  // 添加用户消息
-  messages.value.push({
-    id: Date.now().toString(),
+  // 1. 屏幕新增打字并落库
+  const msgId = Date.now().toString()
+  messages.value.push(parseMessage({
+    id: msgId,
     role: 'user',
     content: text
-  })
+  }))
+  
+  try {
+    await invoke('save_message', { 
+      id: msgId, 
+      sessionId: activeConversationId.value, 
+      role: 'user', 
+      content: text 
+    })
+  } catch(e) {
+    console.error('保存用户消息失败', e)
+  }
   inputText.value = ''
-  isLoading.value = true
+  const currentSessionId = activeConversationId.value
+  loadingMap[currentSessionId] = true
   await scrollToBottom()
 
   try {
-    const chatMessages = messages.value.map(m => ({
+    // 上下文管理（短期记忆）：过滤有效消息，并仅截取最近 10 条（5轮交互）作为上下文
+    const validMessages = messages.value.filter(m => m.role === 'user' || m.role === 'assistant')
+    const contextMessages = validMessages.slice(-10).map(m => ({
       role: m.role,
       content: m.content
     }))
-    const reply = await invoke<string>('chat_with_ai', { messages: chatMessages })
-    messages.value.push({
-      id: (Date.now() + 1).toString(),
-      role: 'assistant',
-      content: reply
+    
+    console.log('Sending messages to AI:', contextMessages)
+    const reply = await invoke<string>('chat_with_ai', { 
+        messages: contextMessages,
+        sessionId: currentSessionId,
+        enableWebSearch: isWebSearchEnabled.value
     })
+    console.log('Received AI reply:', reply)
+    const replyId = (Date.now() + 1).toString()
+    
+    // 只有当当前活跃的对话还是发送时的那个对话时，才推入内存列表
+    // 否则，用户切换回来时会通过 switchConversation 重新从数据库加载新保存的消息
+    if (activeConversationId.value === currentSessionId) {
+      messages.value.push(parseMessage({
+        id: replyId,
+        role: 'assistant',
+        content: reply
+      }))
+    }
+    
+    // AI 回复落库
+    try {
+      await invoke('save_message', { 
+        id: replyId, 
+        sessionId: currentSessionId, 
+        role: 'assistant', 
+        content: reply 
+      })
+      // 刷新一下标题的时间展示
+      const c = conversations.value.find(c => c.id === currentSessionId)
+      if (c) c.time = new Date().toLocaleTimeString()
+    } catch(e) {
+      console.error('保存AI消息失败', e)
+    }
+    
   } catch (e) {
-    messages.value.push({
-      id: (Date.now() + 1).toString(),
-      role: 'assistant',
-      content: `错误: ${e}`
-    })
+    if (activeConversationId.value === currentSessionId) {
+      messages.value.push(parseMessage({
+        id: (Date.now() + 1).toString(),
+        role: 'system',
+        content: `错误: ${e}`
+      }))
+    }
   } finally {
-    isLoading.value = false
+    loadingMap[currentSessionId] = false
     await scrollToBottom()
   }
 }
@@ -164,10 +315,37 @@ const startNewChat = () => {
   messages.value = []
 }
 
-const switchConversation = (conv: Conversation) => {
+const switchConversation = async (conv: Conversation) => {
   activeConversationId.value = conv.id
-  // 简化：新对话无历史消息
   messages.value = []
+  try {
+    const rawMsgs = await invoke<any[]>('load_messages', { sessionId: conv.id })
+    messages.value = rawMsgs.map(m => parseMessage({
+      id: m.id,
+      role: m.role,
+      content: m.content
+    }))
+  } catch(e) {
+    console.error('拉取历史消息失败', e)
+  }
+  scrollToBottom()
+}
+
+const deleteConversation = async (id: string) => {
+  try {
+    await invoke('delete_conversation_record', { sessionId: id })
+    conversations.value = conversations.value.filter(c => c.id !== id)
+    if (activeConversationId.value === id) {
+      activeConversationId.value = ''
+      messages.value = []
+      if (conversations.value.length > 0) {
+        switchConversation(conversations.value[0])
+      }
+    }
+    ElMessage.success('会话已删除')
+  } catch(e) {
+    ElMessage.error(`删除失败: ${e}`)
+  }
 }
 
 // ========== 知识库操作 ==========
@@ -247,7 +425,10 @@ const handleDeleteDoc = async (id: string) => {
             @click="switchConversation(conv)"
           >
             <el-icon><ChatDotRound /></el-icon>
-            <span class="conv-title">{{ conv.title }}</span>
+            <span class="conv-title" :title="conv.title">{{ conv.title }}</span>
+            <el-icon class="conv-delete" @click.stop="deleteConversation(conv.id)" title="删除对话">
+              <Delete />
+            </el-icon>
           </div>
           <div v-if="conversations.length === 0" class="empty-hint">
             暂无对话记录
@@ -283,12 +464,28 @@ const handleDeleteDoc = async (id: string) => {
               {{ msg.role === 'user' ? '👤' : '🍃' }}
             </div>
             <div class="message-bubble">
-              <div class="message-content">{{ msg.content }}</div>
+              <div class="message-content">
+                <template v-if="msg.role === 'assistant'">
+                   <Thinking
+                        v-if="msg.thinking"
+                        status="end"
+                        :model-value="false"
+                        :content="msg.thinking"
+                        button-width="180px"
+                        max-width="100%"
+                        background-color="#2a2a2a"
+                        color="#d1d1d1"
+                        style="margin-bottom: 8px;"
+                    />
+                    <div class="answer-text">{{ msg.answer || msg.content }}</div>
+                </template>
+                <template v-else>{{ msg.answer || msg.content }}</template>
+              </div>
             </div>
           </div>
 
-          <!-- Loading -->
-          <div v-if="isLoading" class="message-row assistant">
+          <!-- Loading (基于 sessionId 隔离) -->
+          <div v-if="loadingMap[activeConversationId]" class="message-row assistant">
             <div class="message-avatar">🍃</div>
             <div class="message-bubble">
               <div class="typing-indicator">
@@ -303,6 +500,15 @@ const handleDeleteDoc = async (id: string) => {
       <div class="input-area">
         <div class="input-wrapper">
           <div class="input-tools">
+            <el-tooltip :content="isWebSearchEnabled ? '关闭联网搜索' : '开启联网搜索'" placement="top">
+              <el-icon class="tool-btn web-search-btn" :class="{ active: isWebSearchEnabled }" @click="isWebSearchEnabled = !isWebSearchEnabled">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="12" cy="12" r="10"></circle>
+                  <line x1="2" y1="12" x2="22" y2="12"></line>
+                  <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
+                </svg>
+              </el-icon>
+            </el-tooltip>
             <el-tooltip content="上传文档" placement="top">
               <el-icon class="tool-btn" @click="handleUploadFile"><Document /></el-icon>
             </el-tooltip>
@@ -339,32 +545,71 @@ const handleDeleteDoc = async (id: string) => {
       </div>
 
       <div class="sidebar-content">
-        <div class="kb-actions">
-          <el-button size="small" @click="handleUploadFile">
-            <el-icon><Document /></el-icon>添加文档
-          </el-button>
-          <el-button size="small" @click="handleUploadVideo">
-            <el-icon><VideoPlay /></el-icon>视频转写
-          </el-button>
+        <!-- 搜索框 -->
+        <div class="kb-search">
+          <el-input
+            v-model="searchQuery"
+            placeholder="搜索知识库..."
+            :prefix-icon="Search"
+            clearable
+            size="small"
+            @input="handleSearch"
+            @clear="clearSearch"
+          />
         </div>
 
-        <div class="kb-list">
-          <div
-            v-for="doc in kbDocuments"
-            :key="doc.id"
-            class="kb-item clickable"
-            @click="showDocDetail(doc)"
-          >
-            <span class="kb-emoji-icon">{{ getDocIcon(doc) }}</span>
-            <span class="kb-name" :title="doc.name">{{ doc.name }}</span>
-            <el-icon class="kb-delete" @click.stop="handleDeleteDoc(doc.id)">
-              <Delete />
-            </el-icon>
+        <!-- 搜索结果 -->
+        <div v-if="hasSearched" class="kb-search-results">
+          <div class="search-header">
+            <span>搜索结果</span>
+            <el-button link size="small" @click="clearSearch">返回列表</el-button>
           </div>
-          <div v-if="kbDocuments.length === 0" class="empty-hint">
-            知识库为空，请添加文档
+          <div v-if="isSearching" class="empty-hint">搜索中...</div>
+          <div v-else-if="searchResults.length === 0" class="empty-hint">未找到匹配内容</div>
+          <div
+            v-for="result in searchResults"
+            :key="result.document.id"
+            class="search-result-item"
+            @click="showDocDetail(result.document)"
+          >
+            <div class="sr-title">
+              <span class="kb-emoji-icon">{{ getDocIcon(result.document) }}</span>
+              <span class="sr-name">{{ result.document.name }}</span>
+              <span class="sr-score">{{ (result.relevance * 100).toFixed(0) }}%</span>
+            </div>
+            <div class="sr-snippet">{{ result.snippet }}</div>
           </div>
         </div>
+
+        <!-- 操作按钮和文档列表（非搜索状态） -->
+        <template v-else>
+          <div class="kb-actions">
+            <el-button size="small" @click="handleUploadFile">
+              <el-icon><Document /></el-icon>添加文档
+            </el-button>
+            <el-button size="small" @click="handleUploadVideo">
+              <el-icon><VideoPlay /></el-icon>视频转写
+            </el-button>
+          </div>
+
+          <div class="kb-list">
+            <div
+              v-for="doc in kbDocuments"
+              :key="doc.id"
+              class="kb-item clickable"
+              @click="showDocDetail(doc)"
+            >
+              <span class="kb-emoji-icon">{{ getDocIcon(doc) }}</span>
+              <span class="kb-name" :title="doc.name">{{ doc.name }}</span>
+              <el-icon class="kb-delete" @click.stop="handleDeleteDoc(doc.id)">
+                <Delete />
+              </el-icon>
+            </div>
+            <div v-if="kbDocuments.length === 0" class="empty-hint">
+              知识库为空，请添加文档
+            </div>
+          </div>
+        </template>
       </div>
     </aside>
 
@@ -403,6 +648,14 @@ const handleDeleteDoc = async (id: string) => {
 </template>
 
 <style scoped>
+.web-search-btn {
+  color: #888;
+}
+.web-search-btn.active {
+  color: #4facfe;
+  filter: drop-shadow(0 0 8px rgba(79, 172, 254, 0.4));
+}
+
 /* ========== 整体布局 ========== */
 .app-layout {
   display: flex;
@@ -564,8 +817,23 @@ const handleDeleteDoc = async (id: string) => {
 }
 
 .conv-title {
+  flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.conv-delete {
+  opacity: 0;
+  transition: opacity 0.2s, color 0.2s;
+  color: #888;
+}
+
+.conversation-item:hover .conv-delete {
+  opacity: 1;
+}
+
+.conv-delete:hover {
+  color: #ff6b6b;
 }
 
 .empty-hint {
@@ -791,6 +1059,85 @@ const handleDeleteDoc = async (id: string) => {
   border-color: rgba(79, 172, 254, 0.3);
 }
 
+.kb-search {
+  margin-bottom: 12px;
+}
+
+.kb-search :deep(.el-input__wrapper) {
+  background: rgba(255,255,255,0.04);
+  border-color: rgba(255,255,255,0.08);
+  border-radius: 10px;
+}
+
+.kb-search :deep(.el-input__inner) {
+  color: #e3e3e3;
+}
+
+.kb-search :deep(.el-input__inner::placeholder) {
+  color: #555;
+}
+
+.kb-search-results {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.search-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+  font-size: 0.8rem;
+  color: #888;
+}
+
+.search-result-item {
+  padding: 10px 10px;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: all 0.15s;
+  border: 1px solid rgba(255,255,255,0.04);
+}
+
+.search-result-item:hover {
+  background: rgba(79, 172, 254, 0.08);
+  border-color: rgba(79, 172, 254, 0.2);
+}
+
+.sr-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+
+.sr-name {
+  flex: 1;
+  font-size: 0.84rem;
+  color: #ccc;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sr-score {
+  font-size: 0.72rem;
+  color: #4facfe;
+  flex-shrink: 0;
+}
+
+.sr-snippet {
+  font-size: 0.76rem;
+  color: #777;
+  line-height: 1.4;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
 .kb-list {
   display: flex;
   flex-direction: column;
@@ -865,5 +1212,64 @@ const handleDeleteDoc = async (id: string) => {
 
 .kb-delete:hover {
   color: #f56c6c;
+}
+/* ========== Thinking 组件暗色适配 ========== */
+:deep(.el-thinking) {
+  width: fit-content;
+  margin: 0 !important; /* 强制左对齐，防止展开后居中 */
+  margin-bottom: 12px !important;
+}
+
+:deep(.el-thinking .trigger) {
+  background: rgba(255, 255, 255, 0.04) !important;
+  border: 1px solid rgba(255, 255, 255, 0.08) !important;
+  color: #9e9ea3 !important;
+  height: 32px !important;
+  padding: 0 12px !important;
+  border-radius: 8px !important;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1) !important;
+}
+
+:deep(.el-thinking .trigger:hover) {
+  background: rgba(255, 255, 255, 0.08) !important;
+  border-color: rgba(79, 172, 254, 0.3) !important;
+  color: #e3e3e3 !important;
+}
+
+:deep(.el-thinking .trigger .label) {
+  font-size: 13px !important;
+  font-weight: 500 !important;
+  color: inherit !important;
+}
+
+:deep(.el-thinking .trigger .status-icon) {
+  font-size: 14px !important;
+}
+
+:deep(.el-thinking .trigger .arrow) {
+  font-size: 12px !important;
+  opacity: 0.6;
+}
+
+/* 展开后的内容区域样式 */
+:deep(.el-thinking .content-wrapper) {
+  margin-top: 8px;
+}
+
+:deep(.el-thinking .content pre) {
+  background: #141414 !important;
+  border: 1px solid #2a2a2a !important;
+  color: #b1b1b1 !important;
+  font-size: 13px !important;
+  line-height: 1.6 !important;
+  padding: 12px !important;
+  border-radius: 8px !important;
+  box-shadow: inset 0 2px 4px rgba(0,0,0,0.2) !important;
+}
+
+/* 消息内容调整 */
+.answer-text {
+  word-break: break-all;
+  white-space: pre-wrap;
 }
 </style>

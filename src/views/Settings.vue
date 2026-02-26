@@ -21,9 +21,54 @@ const asrProgress = ref(0)
 const asrProgressFile = ref('')
 const asrProgressBytes = ref('')
 
+// ========== Embedding 模型状态 ==========
+interface EmbeddingModelStatus {
+  name: string
+  description: string
+  size_mb: number
+  is_installed: boolean
+  model_dir: string
+}
+
+const embeddingStatus = ref<EmbeddingModelStatus | null>(null)
+const embeddingLoading = ref(true)
+const embeddingDownloading = ref(false)
+const embeddingProgress = ref(0)
+const embeddingProgressFile = ref('')
+const embeddingProgressBytes = ref('')
+
+// ========== AI 设置 ==========
+interface AiSettings {
+  provider: string
+  doubao_api_key: string | null
+  openai_api_key: string | null
+  deepseek_api_key: string | null
+  lm_studio_url: string
+}
+
+const aiSettings = ref<AiSettings>({
+  provider: 'lmstudio',
+  doubao_api_key: null,
+  openai_api_key: null,
+  deepseek_api_key: null,
+  lm_studio_url: 'http://localhost:1234',
+})
+const aiSaving = ref(false)
+const lmStudioRunning = ref<boolean | null>(null)
+const lmStudioChecking = ref(false)
+
+const providerOptions = [
+  { label: 'LM Studio (本地)', value: 'lmstudio' },
+  { label: '豆包', value: 'doubao' },
+  { label: 'OpenAI', value: 'openai' },
+  { label: 'DeepSeek', value: 'deepseek' },
+]
+
 // ========== 初始化 ==========
 onMounted(async () => {
   await checkAsrModel()
+  await checkEmbeddingModel()
+  await loadAiSettings()
 
   listen<any>('model-download-progress', (event) => {
     const d = event.payload
@@ -33,7 +78,6 @@ onMounted(async () => {
       asrProgressBytes.value = `${formatBytes(d.downloaded_bytes)} / ${formatBytes(d.total_bytes)}`
     }
     if (d.status === 'completed' && (d.file_name === 'tokens.txt' || d.file_name === 'model.onnx')) {
-      // 如果 tokens.txt 完成或者是唯一的跳过文件，尝试停止加载
       checkAsrModel()
       if (d.file_name === 'tokens.txt') {
         asrDownloading.value = false
@@ -42,6 +86,26 @@ onMounted(async () => {
     }
     if (d.status === 'failed') {
       asrDownloading.value = false
+      ElMessage.error(`下载失败: ${d.file_name}`)
+    }
+  })
+
+  listen<any>('embedding-model-progress', (event) => {
+    const d = event.payload
+    embeddingProgressFile.value = d.file_name
+    embeddingProgress.value = Math.round(d.progress * 100)
+    if (d.total_bytes > 0) {
+      embeddingProgressBytes.value = `${formatBytes(d.downloaded_bytes)} / ${formatBytes(d.total_bytes)}`
+    }
+    if (d.status === 'completed' && (d.file_name === 'vocab.txt' || d.file_name === 'model.onnx')) {
+      checkEmbeddingModel()
+      if (d.file_name === 'vocab.txt') {
+        embeddingDownloading.value = false
+        ElMessage.success('向量知识库模型下载完成！')
+      }
+    }
+    if (d.status === 'failed') {
+      embeddingDownloading.value = false
       ElMessage.error(`下载失败: ${d.file_name}`)
     }
   })
@@ -72,10 +136,74 @@ const handleDownloadAsr = async () => {
   }
 }
 
+const checkEmbeddingModel = async () => {
+  embeddingLoading.value = true
+  try {
+    embeddingStatus.value = await invoke<EmbeddingModelStatus>('get_embedding_model_status')
+  } catch (e) {
+    console.error('check embedding model:', e)
+  } finally {
+    embeddingLoading.value = false
+  }
+}
+
+const handleDownloadEmbedding = async () => {
+  embeddingDownloading.value = true
+  embeddingProgress.value = 0
+  embeddingProgressBytes.value = ''
+  try {
+    await invoke('download_embedding_model')
+    embeddingDownloading.value = false
+    await checkEmbeddingModel()
+  } catch (e) {
+    embeddingDownloading.value = false
+    ElMessage.error(`下载失败: ${e}`)
+  }
+}
+
 const formatBytes = (bytes: number): string => {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
+// ========== AI 设置操作 ==========
+const loadAiSettings = async () => {
+  try {
+    const settings = await invoke<AiSettings>('get_ai_settings')
+    aiSettings.value = settings
+  } catch (e) {
+    console.warn('加载 AI 设置失败:', e)
+  }
+}
+
+const saveAiSettings = async () => {
+  aiSaving.value = true
+  try {
+    await invoke('update_ai_settings', { settings: aiSettings.value })
+    ElMessage.success('AI 设置已保存')
+  } catch (e) {
+    ElMessage.error(`保存失败: ${e}`)
+  } finally {
+    aiSaving.value = false
+  }
+}
+
+const checkLmStudio = async () => {
+  lmStudioChecking.value = true
+  try {
+    lmStudioRunning.value = await invoke<boolean>('check_lm_studio')
+    if (lmStudioRunning.value) {
+      ElMessage.success('LM Studio 连接成功')
+    } else {
+      ElMessage.warning('LM Studio 未运行')
+    }
+  } catch (e) {
+    lmStudioRunning.value = false
+    ElMessage.error('检测失败')
+  } finally {
+    lmStudioChecking.value = false
+  }
 }
 </script>
 
@@ -87,6 +215,145 @@ const formatBytes = (bytes: number): string => {
     </div>
 
     <div class="settings-body">
+      <!-- ====== AI 配置 ====== -->
+      <div class="settings-card">
+        <div class="card-header">
+          <div class="card-icon ai">🤖</div>
+          <div>
+            <h2>AI 服务</h2>
+            <p>配置智能问答引擎（不配置时使用全文搜索）</p>
+          </div>
+        </div>
+
+        <div class="card-body">
+          <div class="form-group">
+            <label>AI 提供者</label>
+            <el-select v-model="aiSettings.provider" style="width: 100%">
+              <el-option
+                v-for="opt in providerOptions"
+                :key="opt.value"
+                :label="opt.label"
+                :value="opt.value"
+              />
+            </el-select>
+          </div>
+
+          <!-- 豆包 -->
+          <div v-if="aiSettings.provider === 'doubao'" class="form-group">
+            <label>豆包 API Key</label>
+            <el-input
+              v-model="aiSettings.doubao_api_key"
+              placeholder="输入豆包 API Key"
+              show-password
+            />
+          </div>
+
+          <!-- OpenAI -->
+          <div v-if="aiSettings.provider === 'openai'" class="form-group">
+            <label>OpenAI API Key</label>
+            <el-input
+              v-model="aiSettings.openai_api_key"
+              placeholder="输入 OpenAI API Key"
+              show-password
+            />
+          </div>
+
+          <!-- DeepSeek -->
+          <div v-if="aiSettings.provider === 'deepseek'" class="form-group">
+            <label>DeepSeek API Key</label>
+            <el-input
+              v-model="aiSettings.deepseek_api_key"
+              placeholder="输入 DeepSeek API Key"
+              show-password
+            />
+          </div>
+
+          <!-- LM Studio -->
+          <div v-if="aiSettings.provider === 'lmstudio'" class="form-group">
+            <label>LM Studio 地址</label>
+            <div style="display: flex; gap: 8px;">
+              <el-input
+                v-model="aiSettings.lm_studio_url"
+                placeholder="http://localhost:1234"
+                style="flex: 1"
+              />
+              <el-button :loading="lmStudioChecking" @click="checkLmStudio">
+                检测
+              </el-button>
+            </div>
+            <div v-if="lmStudioRunning !== null" class="lm-status">
+              <el-tag v-if="lmStudioRunning" type="success" size="small" effect="dark" round>已连接</el-tag>
+              <el-tag v-else type="danger" size="small" effect="dark" round>未运行</el-tag>
+            </div>
+          </div>
+        </div>
+
+        <div class="card-footer">
+          <el-button type="primary" :loading="aiSaving" @click="saveAiSettings">
+            保存设置
+          </el-button>
+        </div>
+      </div>
+
+      <!-- ====== Embedding 模型管理 ====== -->
+      <div class="settings-card">
+        <div class="card-header">
+          <div class="card-icon embedding">🧠</div>
+          <div>
+            <h2>向量检索模型</h2>
+            <p>BGE-small-zh — 用于知识库语义搜索，提升问答匹配准确率</p>
+          </div>
+        </div>
+
+        <div class="card-body">
+          <div v-if="embeddingLoading" class="status-loading">
+            <el-icon class="is-loading"><Loading /></el-icon>
+            <span>检测模型状态...</span>
+          </div>
+
+          <template v-else-if="embeddingStatus">
+            <div class="model-info">
+              <div class="model-name">
+                {{ embeddingStatus.name }}
+                <el-tag v-if="embeddingStatus.is_installed" type="success" size="small" effect="dark" round>
+                  <el-icon><Check /></el-icon> 已安装
+                </el-tag>
+                <el-tag v-else type="warning" size="small" effect="dark" round>
+                  未安装
+                </el-tag>
+              </div>
+              <div class="model-desc">{{ embeddingStatus.description }}</div>
+              <div class="model-meta">
+                <span>大小: ~{{ embeddingStatus.size_mb }}MB</span>
+                <span>语言: 中文</span>
+              </div>
+            </div>
+
+            <div v-if="embeddingDownloading" class="download-progress">
+              <div class="progress-info">
+                <span>正在下载: {{ embeddingProgressFile }}</span>
+                <span>{{ embeddingProgressBytes }}</span>
+              </div>
+              <el-progress :percentage="embeddingProgress" :stroke-width="8" color="#4facfe" />
+            </div>
+          </template>
+        </div>
+
+        <div class="card-footer">
+          <template v-if="embeddingStatus?.is_installed">
+            <span class="model-dir" :title="embeddingStatus?.model_dir">
+              📂 {{ embeddingStatus?.model_dir }}
+            </span>
+          </template>
+          <template v-else>
+            <el-button type="primary" :loading="embeddingDownloading" @click="handleDownloadEmbedding">
+              <el-icon v-if="!embeddingDownloading"><Download /></el-icon>
+              {{ embeddingDownloading ? '下载中...' : '下载模型' }}
+            </el-button>
+          </template>
+        </div>
+      </div>
+
       <!-- ====== ASR 模型管理 ====== -->
       <div class="settings-card">
         <div class="card-header">
@@ -121,17 +388,12 @@ const formatBytes = (bytes: number): string => {
               </div>
             </div>
 
-            <!-- 下载进度 -->
             <div v-if="asrDownloading" class="download-progress">
               <div class="progress-info">
                 <span>正在下载: {{ asrProgressFile }}</span>
                 <span>{{ asrProgressBytes }}</span>
               </div>
-              <el-progress
-                :percentage="asrProgress"
-                :stroke-width="8"
-                color="#4facfe"
-              />
+              <el-progress :percentage="asrProgress" :stroke-width="8" color="#4facfe" />
             </div>
           </template>
         </div>
@@ -143,11 +405,7 @@ const formatBytes = (bytes: number): string => {
             </span>
           </template>
           <template v-else>
-            <el-button
-              type="primary"
-              :loading="asrDownloading"
-              @click="handleDownloadAsr"
-            >
+            <el-button type="primary" :loading="asrDownloading" @click="handleDownloadAsr">
               <el-icon v-if="!asrDownloading"><Download /></el-icon>
               {{ asrDownloading ? '下载中...' : '下载模型' }}
             </el-button>
@@ -168,6 +426,7 @@ const formatBytes = (bytes: number): string => {
           <div class="about-info">
             <div class="about-row"><span>版本</span><span>0.1.0</span></div>
             <div class="about-row"><span>框架</span><span>Tauri 2 + Vue 3</span></div>
+            <div class="about-row"><span>搜索引擎</span><span>Tantivy (jieba 中文分词)</span></div>
             <div class="about-row"><span>ASR 引擎</span><span>Sherpa-ONNX (SenseVoice)</span></div>
           </div>
         </div>
@@ -209,7 +468,6 @@ const formatBytes = (bytes: number): string => {
   gap: 20px;
 }
 
-/* ====== Card ====== */
 .settings-card {
   background: #22223a;
   border: 1px solid rgba(255,255,255,0.06);
@@ -235,13 +493,10 @@ const formatBytes = (bytes: number): string => {
   font-size: 1.3rem;
 }
 
-.card-icon.asr {
-  background: rgba(244, 63, 94, 0.12);
-}
-
-.card-icon.about {
-  background: rgba(79, 172, 254, 0.12);
-}
+.card-icon.ai { background: rgba(79, 172, 254, 0.12); }
+.card-icon.asr { background: rgba(244, 63, 94, 0.12); }
+.card-icon.embedding { background: rgba(167, 139, 250, 0.12); }
+.card-icon.about { background: rgba(79, 172, 254, 0.12); }
 
 .card-header h2 {
   font-size: 0.95rem;
@@ -256,9 +511,7 @@ const formatBytes = (bytes: number): string => {
   margin: 2px 0 0;
 }
 
-.card-body {
-  padding: 20px 24px;
-}
+.card-body { padding: 20px 24px; }
 
 .card-footer {
   padding: 14px 24px;
@@ -270,7 +523,17 @@ const formatBytes = (bytes: number): string => {
   gap: 10px;
 }
 
-/* ====== Model Info ====== */
+.form-group { margin-bottom: 16px; }
+
+.form-group label {
+  display: block;
+  font-size: 0.82rem;
+  color: #888;
+  margin-bottom: 6px;
+}
+
+.lm-status { margin-top: 8px; }
+
 .status-loading {
   display: flex;
   align-items: center;
@@ -293,10 +556,7 @@ const formatBytes = (bytes: number): string => {
   gap: 10px;
 }
 
-.model-desc {
-  font-size: 0.82rem;
-  color: #888;
-}
+.model-desc { font-size: 0.82rem; color: #888; }
 
 .model-meta {
   display: flex;
@@ -315,7 +575,6 @@ const formatBytes = (bytes: number): string => {
   max-width: 400px;
 }
 
-/* ====== Download Progress ====== */
 .download-progress {
   margin-top: 16px;
   padding: 14px;
@@ -331,7 +590,6 @@ const formatBytes = (bytes: number): string => {
   margin-bottom: 8px;
 }
 
-/* ====== About ====== */
 .about-info {
   display: flex;
   flex-direction: column;
@@ -344,11 +602,6 @@ const formatBytes = (bytes: number): string => {
   font-size: 0.85rem;
 }
 
-.about-row span:first-child {
-  color: #888;
-}
-
-.about-row span:last-child {
-  color: #ccc;
-}
+.about-row span:first-child { color: #888; }
+.about-row span:last-child { color: #ccc; }
 </style>

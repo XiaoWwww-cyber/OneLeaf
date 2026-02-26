@@ -18,6 +18,10 @@ from pydantic import BaseModel
 import json
 import math
 
+# 模型文件名常量 (与 Rust 端 asr.rs 保持一致)
+MODEL_FILE = "model.onnx"
+TOKENS_FILE = "tokens.txt"
+
 app = FastAPI(title="ASR GPU Server")
 
 # 全局模型实例

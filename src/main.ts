@@ -5,6 +5,8 @@ import 'element-plus/dist/index.css'
 // @ts-ignore
 import ElementPlusX from 'element-plus-x'
 import 'element-plus-x/dist/index.css'
+// @ts-ignore
+import VueElementPlusX from 'vue-element-plus-x'
 import { createPinia } from 'pinia'
 import router from './router'
 import * as ElementPlusIconsVue from '@element-plus/icons-vue'
@@ -19,4 +21,5 @@ app.use(createPinia())
 app.use(router)
 app.use(ElementPlus)
 app.use(ElementPlusX)
+app.use(VueElementPlusX)
 app.mount("#app");
