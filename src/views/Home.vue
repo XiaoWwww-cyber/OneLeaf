@@ -1,11 +1,11 @@
 <script setup lang="ts">
-import { ref, reactive, nextTick, onMounted } from 'vue'
+import { ref, reactive, nextTick, onMounted, computed } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
 import { ElMessage } from 'element-plus'
 import {
   ChatDotRound, Document, VideoPlay, Position,
-  Plus, Fold, Expand, Delete, Search
+  Plus, Fold, Expand, Delete, Search, ArrowDown
 } from '@element-plus/icons-vue'
 import VideoTranscriptDialog from '../components/VideoTranscriptDialog.vue'
 
@@ -40,6 +40,20 @@ const isLoading = ref(false)
 const loadingMap = reactive<Record<string, boolean>>({})
 const chatAreaRef = ref<HTMLElement>()
 const isWebSearchEnabled = ref(false)
+
+const thinkingDepth = ref('none')
+const thinkingDepthLabel = computed(() => {
+  const map: Record<string, string> = {
+    none: '关闭',
+    low: '低',
+    medium: '中',
+    high: '高'
+  }
+  return map[thinkingDepth.value]
+})
+const handleThinkingDepth = (command: string) => {
+  thinkingDepth.value = command
+}
 
 /** 更加鲁棒的解析函数 */
 const parseMessage = (msg: {role: string, content: string, id?: string}): Message => {
@@ -259,7 +273,8 @@ const handleSend = async () => {
     const reply = await invoke<string>('chat_with_ai', { 
         messages: contextMessages,
         sessionId: currentSessionId,
-        enableWebSearch: isWebSearchEnabled.value
+        enableWebSearch: isWebSearchEnabled.value,
+        thinkingDepth: thinkingDepth.value !== 'none' ? thinkingDepth.value : null
     })
     console.log('Received AI reply:', reply)
     const replyId = (Date.now() + 1).toString()
@@ -500,15 +515,29 @@ const handleDeleteDoc = async (id: string) => {
       <div class="input-area">
         <div class="input-wrapper">
           <div class="input-tools">
-            <el-tooltip :content="isWebSearchEnabled ? '关闭联网搜索' : '开启联网搜索'" placement="top">
-              <el-icon class="tool-btn web-search-btn" :class="{ active: isWebSearchEnabled }" @click="isWebSearchEnabled = !isWebSearchEnabled">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <circle cx="12" cy="12" r="10"></circle>
-                  <line x1="2" y1="12" x2="22" y2="12"></line>
-                  <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
-                </svg>
-              </el-icon>
-            </el-tooltip>
+            <div 
+              class="pill-btn web-search-btn" 
+              :class="{ active: isWebSearchEnabled }" 
+              @click="isWebSearchEnabled = !isWebSearchEnabled"
+            >
+              <span>🌍 联网</span>
+            </div>
+
+            <el-dropdown trigger="click" @command="handleThinkingDepth">
+              <div class="pill-btn dropdown-trigger" :class="{ active: thinkingDepth !== 'none' }">
+                <span>🧠 思考深度: {{ thinkingDepthLabel }}</span>
+                <el-icon class="el-icon--right"><ArrowDown /></el-icon>
+              </div>
+              <template #dropdown>
+                <el-dropdown-menu>
+                  <el-dropdown-item command="none" :class="{ 'is-active': thinkingDepth === 'none' }">关闭</el-dropdown-item>
+                  <el-dropdown-item command="low" :class="{ 'is-active': thinkingDepth === 'low' }">低</el-dropdown-item>
+                  <el-dropdown-item command="medium" :class="{ 'is-active': thinkingDepth === 'medium' }">中</el-dropdown-item>
+                  <el-dropdown-item command="high" :class="{ 'is-active': thinkingDepth === 'high' }">高</el-dropdown-item>
+                </el-dropdown-menu>
+              </template>
+            </el-dropdown>
+
             <el-tooltip content="上传文档" placement="top">
               <el-icon class="tool-btn" @click="handleUploadFile"><Document /></el-icon>
             </el-tooltip>
@@ -653,7 +682,42 @@ const handleDeleteDoc = async (id: string) => {
 }
 .web-search-btn.active {
   color: #4facfe;
-  filter: drop-shadow(0 0 8px rgba(79, 172, 254, 0.4));
+  border-color: rgba(79, 172, 254, 0.4);
+  background: rgba(79, 172, 254, 0.1);
+}
+
+.pill-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border-radius: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.02);
+  color: #888;
+  font-size: 0.85rem;
+  cursor: pointer;
+  transition: all 0.2s;
+  user-select: none;
+}
+
+.pill-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: #e3e3e3;
+}
+
+.dropdown-trigger {
+  outline: none;
+}
+.dropdown-trigger.active {
+  color: #a450ff;
+  border-color: rgba(164, 80, 255, 0.4);
+  background: rgba(164, 80, 255, 0.1);
+}
+
+:deep(.el-dropdown-menu__item.is-active) {
+  color: #a450ff;
+  background-color: rgba(164, 80, 255, 0.1);
 }
 
 /* ========== 整体布局 ========== */

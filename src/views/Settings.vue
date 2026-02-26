@@ -41,6 +41,7 @@ const embeddingProgressBytes = ref('')
 interface AiSettings {
   provider: string
   doubao_api_key: string | null
+  doubao_model_id: string | null
   openai_api_key: string | null
   deepseek_api_key: string | null
   lm_studio_url: string
@@ -49,6 +50,7 @@ interface AiSettings {
 const aiSettings = ref<AiSettings>({
   provider: 'lmstudio',
   doubao_api_key: null,
+  doubao_model_id: 'doubao-seed-2-0-pro-260215',
   openai_api_key: null,
   deepseek_api_key: null,
   lm_studio_url: 'http://localhost:1234',
@@ -248,6 +250,15 @@ const checkLmStudio = async () => {
             />
           </div>
 
+          <div v-if="aiSettings.provider === 'doubao'" class="form-group">
+            <label>豆包模型名称</label>
+            <el-input
+              v-model="aiSettings.doubao_model_id"
+              placeholder="doubao-seed-2-0-pro-260215"
+            />
+            <p style="font-size: 0.75rem; color: #666; margin-top: 4px;">填写模型名称（如 doubao-seed-2-0-pro-260215）或火山引擎 Ark 推理点 ID（如 ep-xxx）</p>
+          </div>
+
           <!-- OpenAI -->
           <div v-if="aiSettings.provider === 'openai'" class="form-group">
             <label>OpenAI API Key</label>
@@ -315,10 +326,10 @@ const checkLmStudio = async () => {
             <div class="model-info">
               <div class="model-name">
                 {{ embeddingStatus.name }}
-                <el-tag v-if="embeddingStatus.is_installed" type="success" size="small" effect="dark" round>
-                  <el-icon><Check /></el-icon> 已安装
+                <el-tag v-if="embeddingStatus.is_installed" type="success" size="small" effect="dark" round class="status-tag">
+                  <el-icon><Check /></el-icon> <span>已安装</span>
                 </el-tag>
-                <el-tag v-else type="warning" size="small" effect="dark" round>
+                <el-tag v-else type="warning" size="small" effect="dark" round class="status-tag">
                   未安装
                 </el-tag>
               </div>
@@ -374,10 +385,10 @@ const checkLmStudio = async () => {
             <div class="model-info">
               <div class="model-name">
                 {{ asrStatus.name }}
-                <el-tag v-if="asrStatus.is_installed" type="success" size="small" effect="dark" round>
-                  <el-icon><Check /></el-icon> 已安装
+                <el-tag v-if="asrStatus.is_installed" type="success" size="small" effect="dark" round class="status-tag">
+                  <el-icon><Check /></el-icon> <span>已安装</span>
                 </el-tag>
-                <el-tag v-else type="warning" size="small" effect="dark" round>
+                <el-tag v-else type="warning" size="small" effect="dark" round class="status-tag">
                   未安装
                 </el-tag>
               </div>
@@ -554,6 +565,18 @@ const checkLmStudio = async () => {
   display: flex;
   align-items: center;
   gap: 10px;
+}
+
+.status-tag {
+  min-width: 80px;
+  /* height: ; */
+  padding: 12px;
+  display: inline-flex !important;
+  flex-direction: row; /* 显式指定水平排列 */
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  white-space: nowrap; /* 强制禁止换行 */
 }
 
 .model-desc { font-size: 0.82rem; color: #888; }

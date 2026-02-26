@@ -32,6 +32,10 @@ struct ChatRequest {
     model: String,
     messages: Vec<ChatMessage>,
     temperature: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,35 +59,66 @@ struct DoubaoProvider {
 }
 
 impl DoubaoProvider {
-    fn new(api_key: String) -> Self {
+    fn new(api_key: String, model: String) -> Self {
         Self {
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(120))
                 .build()
                 .unwrap_or_default(),
             api_key,
-            model: "doubao-seed-1-8-251228".to_string(),
+            model,
             base_url: "https://ark.cn-beijing.volces.com/api/v3".to_string(),
         }
     }
 
-    async fn chat(&self, messages: Vec<ChatMessage>) -> Result<String, AiError> {
+    async fn chat(&self, messages: Vec<ChatMessage>, enable_web_search: bool, thinking_depth: Option<String>) -> Result<String, AiError> {
         let request = ChatRequest {
             model: self.model.clone(),
             messages,
             temperature: 0.7,
+            reasoning_effort: thinking_depth,
+            tools: if enable_web_search {
+                // 根据火山方舟官方建议，如果是调用的 Responses API
+                // 则直接传入 {"type": "web_search"} 即可启用内置的原生搜索引擎
+                Some(vec![serde_json::json!({
+                    "type": "web_search"
+                })])
+            } else {
+                None
+            },
         };
         self.send_request(&request).await
     }
 
     async fn send_request(&self, request: &ChatRequest) -> Result<String, AiError> {
+        let (endpoint, payload) = if request.tools.is_some() {
+            // 当且仅当使用 tools 扩展时，使用火山引擎推荐的 Responses API
+            let mut payload = serde_json::json!({
+                "model": request.model,
+                "input": request.messages,
+                "temperature": request.temperature,
+                "tools": request.tools
+            });
+            // 只有当有值时才插入 reasoning_effort，避免 null 影响其校验
+            if let Some(re) = &request.reasoning_effort {
+                if let Some(obj) = payload.as_object_mut() {
+                    obj.insert("reasoning_effort".to_string(), serde_json::Value::String(re.clone()));
+                }
+            }
+            ("responses", payload)
+        } else {
+            // 标准 Chat API 兼容
+            let payload = serde_json::to_value(request).unwrap_or_default();
+            ("chat/completions", payload)
+        };
+
         let response = self
             .client
-            .post(format!("{}/chat/completions", self.base_url))
+            .post(format!("{}/{}", self.base_url, endpoint))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
             .timeout(std::time::Duration::from_secs(60))
-            .json(request)
+            .json(&payload)
             .send()
             .await?;
 
@@ -96,16 +131,66 @@ impl DoubaoProvider {
             )));
         }
 
-        let chat_response: ChatResponse = response
+        let response_json: serde_json::Value = response
             .json()
             .await
             .map_err(|e| AiError::ParseError(e.to_string()))?;
 
-        chat_response
-            .choices
-            .first()
-            .map(|c| c.message.content.clone())
-            .ok_or_else(|| AiError::ParseError("空响应".to_string()))
+        if endpoint == "responses" {
+            // 解析 Responses API 返回的格式
+            if let Some(output_arr) = response_json["output"].as_array() {
+                let mut reasoning_text = String::new();
+                let mut content_text = String::new();
+
+                for item in output_arr {
+                    if let Some(item_type) = item["type"].as_str() {
+                        if item_type == "reasoning" {
+                            if let Some(summary_arr) = item["summary"].as_array() {
+                                for sum in summary_arr {
+                                    if sum["type"].as_str() == Some("summary_text") {
+                                        if let Some(text) = sum["text"].as_str() {
+                                            reasoning_text.push_str(text);
+                                        }
+                                    }
+                                }
+                            }
+                        } else if item_type == "message" {
+                            if let Some(content_arr) = item["content"].as_array() {
+                                for cont in content_arr {
+                                    if cont["type"].as_str() == Some("output_text") {
+                                        if let Some(text) = cont["text"].as_str() {
+                                            content_text.push_str(text);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let mut final_text = String::new();
+                let rt = reasoning_text.trim();
+                if !rt.is_empty() {
+                    final_text.push_str("<think>\n");
+                    final_text.push_str(rt);
+                    final_text.push_str("\n</think>\n\n");
+                }
+                final_text.push_str(content_text.trim());
+
+                if !final_text.is_empty() {
+                    return Ok(final_text);
+                }
+            }
+            Err(AiError::ParseError(format!("无法从 Responses API 解析内容: {}", response_json)))
+        } else {
+            // 解析标准 Chat API 返回的格式
+            if let Some(choices) = response_json["choices"].as_array().and_then(|arr| arr.first()) {
+                if let Some(content) = choices["message"]["content"].as_str() {
+                    return Ok(content.to_string());
+                }
+            }
+            Err(AiError::ParseError(format!("无法从 Chat API 解析内容: {}", response_json)))
+        }
     }
 }
 
@@ -130,11 +215,13 @@ impl OpenAiProvider {
         }
     }
 
-    async fn chat(&self, messages: Vec<ChatMessage>) -> Result<String, AiError> {
+    async fn chat(&self, messages: Vec<ChatMessage>, _enable_web_search: bool, _thinking_depth: Option<String>) -> Result<String, AiError> {
         let request = ChatRequest {
             model: self.model.clone(),
             messages,
             temperature: 0.7,
+            reasoning_effort: None,
+            tools: None,
         };
 
         let response = self
@@ -192,11 +279,13 @@ impl DeepSeekProvider {
         }
     }
 
-    async fn chat(&self, messages: Vec<ChatMessage>) -> Result<String, AiError> {
+    async fn chat(&self, messages: Vec<ChatMessage>, _enable_web_search: bool, _thinking_depth: Option<String>) -> Result<String, AiError> {
         let request = ChatRequest {
             model: self.model.clone(),
             messages,
             temperature: 0.7,
+            reasoning_effort: None,
+            tools: None,
         };
 
         let response = self
@@ -261,7 +350,7 @@ impl LmStudioProvider {
         }
     }
 
-    async fn chat(&self, messages: Vec<ChatMessage>) -> Result<String, AiError> {
+    async fn chat(&self, messages: Vec<ChatMessage>, _enable_web_search: bool, _thinking_depth: Option<String>) -> Result<String, AiError> {
         if !self.is_running().await {
             return Err(AiError::ServiceUnavailable("LM Studio 未运行".to_string()));
         }
@@ -270,6 +359,8 @@ impl LmStudioProvider {
             model: "default".to_string(),
             messages,
             temperature: 0.7,
+            reasoning_effort: None,
+            tools: None,
         };
 
         let response = self
@@ -316,6 +407,7 @@ pub enum AiProviderType {
 pub struct AiService {
     pub provider_type: AiProviderType,
     pub doubao_api_key: Option<String>,
+    pub doubao_model: Option<String>,
     pub openai_api_key: Option<String>,
     pub deepseek_api_key: Option<String>,
     pub lm_studio_url: String,
@@ -326,6 +418,7 @@ impl Default for AiService {
         Self {
             provider_type: AiProviderType::LmStudio,
             doubao_api_key: None,
+            doubao_model: Some("doubao-seed-2-0-pro-260215".to_string()),
             openai_api_key: None,
             deepseek_api_key: None,
             lm_studio_url: "http://localhost:1234".to_string(),
@@ -344,6 +437,10 @@ impl AiService {
 
     pub fn set_doubao_key(&mut self, api_key: String) {
         self.doubao_api_key = Some(api_key);
+    }
+
+    pub fn set_doubao_model(&mut self, model: String) {
+        self.doubao_model = Some(model);
     }
 
     pub fn set_openai_key(&mut self, api_key: String) {
@@ -375,26 +472,29 @@ impl AiService {
     }
 
     /// 调用 AI 对话
-    pub async fn chat(&self, messages: Vec<ChatMessage>) -> Result<String, AiError> {
+    pub async fn chat(&self, messages: Vec<ChatMessage>, enable_web_search: bool, thinking_depth: Option<String>) -> Result<String, AiError> {
+        tracing::info!("--- 正在调用 AI 服务，提供者: {:?} ---", self.provider_type);
         match self.provider_type {
             AiProviderType::Doubao => {
                 let api_key = self.doubao_api_key.clone().ok_or(AiError::InvalidApiKey)?;
-                let provider = DoubaoProvider::new(api_key);
-                provider.chat(messages).await
+                let model = self.doubao_model.clone().unwrap_or_else(|| "doubao-seed-2-0-pro-260215".to_string());
+                tracing::info!("豆包模型: {}, API Base: https://ark.cn-beijing.volces.com/api/v3", model);
+                let provider = DoubaoProvider::new(api_key, model);
+                provider.chat(messages, enable_web_search, thinking_depth).await
             }
             AiProviderType::OpenAi => {
                 let api_key = self.openai_api_key.clone().ok_or(AiError::InvalidApiKey)?;
                 let provider = OpenAiProvider::new(api_key);
-                provider.chat(messages).await
+                provider.chat(messages, enable_web_search, thinking_depth).await
             }
             AiProviderType::DeepSeek => {
                 let api_key = self.deepseek_api_key.clone().ok_or(AiError::InvalidApiKey)?;
                 let provider = DeepSeekProvider::new(api_key);
-                provider.chat(messages).await
+                provider.chat(messages, enable_web_search, thinking_depth).await
             }
             AiProviderType::LmStudio => {
                 let provider = LmStudioProvider::new(self.lm_studio_url.clone());
-                provider.chat(messages).await
+                provider.chat(messages, enable_web_search, thinking_depth).await
             }
         }
     }

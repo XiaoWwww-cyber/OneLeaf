@@ -28,6 +28,9 @@ pub fn run() {
             // 初始化 ASR Sidecar 服务
             core::sidecar_manager::init_sidecar(app.handle());
 
+            // 启动时读取持久化的 AI 配置
+            commands::ai::init_ai_settings(app.handle());
+
             // 监听菜单事件
             let app_handle = app.handle().clone();
             app.on_menu_event(move |_app, event| {
@@ -58,6 +61,7 @@ pub fn run() {
             commands::ai::get_document_content,
             commands::ai::open_document_file,
             commands::ai::get_ai_settings,
+            commands::ai::update_ai_settings,
             commands::ai::check_lm_studio,
             commands::ai::get_embedding_model_status,
             commands::ai::download_embedding_model,

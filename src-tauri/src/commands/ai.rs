@@ -22,6 +22,7 @@ pub static AI_SERVICE: Lazy<Arc<Mutex<AiService>>> =
 pub struct AiSettings {
     pub provider: String,
     pub doubao_api_key: Option<String>,
+    pub doubao_model_id: Option<String>,
     pub openai_api_key: Option<String>,
     pub deepseek_api_key: Option<String>,
     pub lm_studio_url: String,
@@ -32,6 +33,7 @@ impl Default for AiSettings {
         Self {
             provider: "lmstudio".to_string(),
             doubao_api_key: None,
+            doubao_model_id: Some("doubao-seed-2-0-pro-260215".to_string()),
             openai_api_key: None,
             deepseek_api_key: None,
             lm_studio_url: "http://localhost:1234".to_string(),
@@ -107,7 +109,12 @@ pub async fn search_knowledge_base(query: String, limit: usize) -> Result<Vec<Se
 /// 3. 调用 AI 服务
 /// 4. AI 未配置时返回搜索结果摘要
 #[tauri::command]
-pub async fn chat_with_ai(messages: Vec<ChatMessage>, session_id: Option<String>, enable_web_search: Option<bool>) -> Result<String, String> {
+pub async fn chat_with_ai(
+    messages: Vec<ChatMessage>,
+    session_id: Option<String>,
+    enable_web_search: Option<bool>,
+    thinking_depth: Option<String>,
+) -> Result<String, String> {
     info!("AI 对话请求，消息数: {}", messages.len());
 
     // 1. 获取最后一条用户消息用于 RAG 搜索
@@ -179,8 +186,16 @@ pub async fn chat_with_ai(messages: Vec<ChatMessage>, session_id: Option<String>
         }
     }
 
-    let do_web_search = enable_web_search.unwrap_or(false);
-    if do_web_search {
+    // 3. 检查 AI 是否已配置
+    let service = AI_SERVICE.lock().clone();
+
+    let mut do_local_web_search = enable_web_search.unwrap_or(false);
+    if do_local_web_search && service.provider_type != AiProviderType::LmStudio {
+        info!("当前使用的是云端模型（{:?}），跳过本地的 DuckDuckGo 搜索，使用原生能力", service.provider_type);
+        do_local_web_search = false;
+    }
+
+    if do_local_web_search {
         if let Some(query) = &last_user_msg {
             info!("执行联网搜索: {}", query);
             match search_web_ddg(query).await {
@@ -207,9 +222,6 @@ pub async fn chat_with_ai(messages: Vec<ChatMessage>, session_id: Option<String>
             }
         }
     }
-
-    // 3. 检查 AI 是否已配置
-    let service = AI_SERVICE.lock().clone();
     
     if !service.is_configured() {
         // AI 未配置，返回搜索结果摘要
@@ -241,7 +253,7 @@ pub async fn chat_with_ai(messages: Vec<ChatMessage>, session_id: Option<String>
     }
 
     if rag_context.is_some() || history_context.is_some() {
-        context_prompt.push_str("(请严格基于以上参考内容和事实记忆给出专业的回复。)\n\n");
+        context_prompt.push_str("(请参考以上知识片段或记忆回答问题。如果参考内容不充足，您可以结合自身知识或者进行联网检索来补充解答。)\n\n");
     } else {
         // 兜底逻辑：如果搜不到内容片段，但知识库里有文档，把文件名告诉 AI
         if let Some(kb) = &kb_opt {
@@ -277,7 +289,8 @@ pub async fn chat_with_ai(messages: Vec<ChatMessage>, session_id: Option<String>
 
     // 5. 调用 AI 服务
     info!("调用 AI 服务...");
-    match service.chat(final_messages).await {
+    let req_enable_web_search = enable_web_search.unwrap_or(false);
+    match service.chat(final_messages, req_enable_web_search, thinking_depth).await {
         Ok(response) => {
             info!("AI 对话成功");
             Ok(response)
@@ -353,7 +366,7 @@ pub async fn load_messages(session_id: String) -> Result<Vec<ChatMessageRecord>,
 
 /// 更新 AI 设置
 #[tauri::command]
-pub async fn update_ai_settings(settings: AiSettings) -> Result<(), String> {
+pub async fn update_ai_settings(app: AppHandle, settings: AiSettings) -> Result<(), String> {
     let mut service = AI_SERVICE.lock();
 
     let provider_type = match settings.provider.as_str() {
@@ -364,28 +377,83 @@ pub async fn update_ai_settings(settings: AiSettings) -> Result<(), String> {
     };
     service.set_provider(provider_type);
 
-    if let Some(key) = settings.doubao_api_key {
+    if let Some(key) = &settings.doubao_api_key {
         if !key.is_empty() {
-            service.set_doubao_key(key);
+            service.set_doubao_key(key.clone());
         }
     }
-    if let Some(key) = settings.openai_api_key {
-        if !key.is_empty() {
-            service.set_openai_key(key);
+    if let Some(model_id) = &settings.doubao_model_id {
+        if !model_id.is_empty() {
+            service.set_doubao_model(model_id.clone());
         }
     }
-    if let Some(key) = settings.deepseek_api_key {
+    if let Some(key) = &settings.openai_api_key {
         if !key.is_empty() {
-            service.set_deepseek_key(key);
+            service.set_openai_key(key.clone());
+        }
+    }
+    if let Some(key) = &settings.deepseek_api_key {
+        if !key.is_empty() {
+            service.set_deepseek_key(key.clone());
         }
     }
 
     if !settings.lm_studio_url.is_empty() {
-        service.set_lm_studio_url(settings.lm_studio_url);
+        service.set_lm_studio_url(settings.lm_studio_url.clone());
     }
 
-    info!("AI 设置已更新，提供者: {:?}", provider_type);
+    save_ai_settings_to_disk(&app, &settings);
+
+    info!("AI 设置已更新并持久化，提供者: {:?}", provider_type);
     Ok(())
+}
+
+/// 将设置持久化到本地文件
+fn save_ai_settings_to_disk(app: &tauri::AppHandle, settings: &AiSettings) {
+    if let Ok(app_dir) = app.path().app_data_dir() {
+        let settings_path = app_dir.join("ai_settings.json");
+        if let Ok(json) = serde_json::to_string_pretty(settings) {
+            let _ = std::fs::write(settings_path, json);
+        }
+    }
+}
+
+/// 启动时从配置文件中读取 AI 设置并初始化
+pub fn init_ai_settings(app: &tauri::AppHandle) {
+    if let Ok(app_dir) = app.path().app_data_dir() {
+        let settings_path = app_dir.join("ai_settings.json");
+        if settings_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&settings_path) {
+                if let Ok(settings) = serde_json::from_str::<AiSettings>(&content) {
+                    let mut service = AI_SERVICE.lock();
+                    let provider_type = match settings.provider.as_str() {
+                        "doubao" => AiProviderType::Doubao,
+                        "openai" => AiProviderType::OpenAi,
+                        "deepseek" => AiProviderType::DeepSeek,
+                        _ => AiProviderType::LmStudio,
+                    };
+                    service.set_provider(provider_type);
+
+                    if let Some(key) = &settings.doubao_api_key {
+                        if !key.is_empty() { service.set_doubao_key(key.clone()); }
+                    }
+                    if let Some(model_id) = &settings.doubao_model_id {
+                        if !model_id.is_empty() { service.set_doubao_model(model_id.clone()); }
+                    }
+                    if let Some(key) = &settings.openai_api_key {
+                        if !key.is_empty() { service.set_openai_key(key.clone()); }
+                    }
+                    if let Some(key) = &settings.deepseek_api_key {
+                        if !key.is_empty() { service.set_deepseek_key(key.clone()); }
+                    }
+                    if !settings.lm_studio_url.is_empty() {
+                        service.set_lm_studio_url(settings.lm_studio_url);
+                    }
+                    info!("已从本地配置文件加载 AI 设置");
+                }
+            }
+        }
+    }
 }
 
 /// 获取 AI 设置
@@ -403,6 +471,7 @@ pub async fn get_ai_settings() -> Result<AiSettings, String> {
     Ok(AiSettings {
         provider: provider.to_string(),
         doubao_api_key: service.doubao_api_key.clone(),
+        doubao_model_id: service.doubao_model.clone(),
         openai_api_key: service.openai_api_key.clone(),
         deepseek_api_key: service.deepseek_api_key.clone(),
         lm_studio_url: service.lm_studio_url.clone(),
