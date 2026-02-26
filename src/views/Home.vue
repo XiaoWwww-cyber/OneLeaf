@@ -1,11 +1,14 @@
 <script setup lang="ts">
-import { ref, reactive, nextTick, onMounted, computed } from 'vue'
+import { ref, reactive, nextTick, onMounted, computed, triggerRef } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-dialog'
 import { ElMessage } from 'element-plus'
+import { marked } from 'marked'
 import {
-  ChatDotRound, Document, VideoPlay, Position,
-  Plus, Fold, Expand, Delete, Search, ArrowDown
+  ChatDotRound, Document, VideoPlay,
+  Fold, Expand, Delete, Search, ArrowDown, EditPen,
+  Paperclip, Lightning, Phone, CopyDocument, More, Top
 } from '@element-plus/icons-vue'
 import VideoTranscriptDialog from '../components/VideoTranscriptDialog.vue'
 
@@ -36,10 +39,28 @@ interface Message {
 const messages = ref<Message[]>([])
 const inputText = ref('')
 
-const isLoading = ref(false)
 const loadingMap = reactive<Record<string, boolean>>({})
 const chatAreaRef = ref<HTMLElement>()
 const isWebSearchEnabled = ref(false)
+const currentAiProvider = ref<string>('')
+
+const isDoubao = computed(() => currentAiProvider.value === 'doubao')
+
+// 当前会话是否正在加载
+const isCurrentLoading = computed(() => {
+  return !!loadingMap[activeConversationId.value]
+})
+
+// 用于中断流式生成
+let stopStreamFlag = false
+
+const handleStopGenerate = () => {
+  stopStreamFlag = true
+  // 立即关闭 loading 状态
+  if (activeConversationId.value) {
+    loadingMap[activeConversationId.value] = false
+  }
+}
 
 const thinkingDepth = ref('none')
 const thinkingDepthLabel = computed(() => {
@@ -55,29 +76,113 @@ const handleThinkingDepth = (command: string) => {
   thinkingDepth.value = command
 }
 
+const textareaRef = ref<HTMLTextAreaElement>()
+const adjustTextareaHeight = () => {
+  if (textareaRef.value) {
+    textareaRef.value.style.height = 'auto'
+    textareaRef.value.style.height = Math.min(textareaRef.value.scrollHeight, 180) + 'px'
+  }
+}
+
+// ========== Markdown 渲染 ==========
+marked.setOptions({
+  breaks: true,
+  gfm: true,
+})
+const renderMarkdown = (text: string): string => {
+  if (!text) return ''
+  try {
+    return marked.parse(text) as string
+  } catch {
+    return text
+  }
+}
+
+// ========== 聊天附件（直传 AI） ==========
+interface ChatAttachment {
+  fileId: string
+  fileType: string // "file" | "image" | "video"
+  fileName: string
+}
+const attachedFiles = ref<ChatAttachment[]>([])
+
+const handleChatUploadFile = async () => {
+  const selected = await open({
+    multiple: false,
+    filters: [{ name: '文档', extensions: ['pdf', 'txt', 'md'] }]
+  })
+  if (!selected || Array.isArray(selected)) return
+  const filePath = selected
+  if (!filePath) return
+
+  const fileName = filePath.split(/[\\/]/).pop() || filePath
+
+  try {
+    ElMessage.info(`正在上传 ${fileName}...`)
+    const fileId = await invoke<string>('upload_file_to_ai', { filePath })
+    attachedFiles.value.push({
+      fileId,
+      fileType: 'file',
+      fileName,
+    })
+    ElMessage.success(`${fileName} 已添加`)
+  } catch (e) {
+    ElMessage.error(`上传失败: ${e}`)
+  }
+}
+
+const handleChatUploadVideo = async () => {
+  const selected = await open({
+    multiple: false,
+    filters: [{ name: '视频', extensions: ['mp4', 'avi', 'mkv', 'mov', 'flv', 'wmv'] }]
+  })
+  if (!selected || Array.isArray(selected)) return
+  const filePath = selected
+  if (!filePath) return
+
+  const fileName = filePath.split(/[\\/]/).pop() || filePath
+
+  try {
+    ElMessage.info(`正在上传 ${fileName}...`)
+    const fileId = await invoke<string>('upload_file_to_ai', { filePath })
+    attachedFiles.value.push({
+      fileId,
+      fileType: 'video',
+      fileName,
+    })
+    ElMessage.success(`${fileName} 已添加`)
+  } catch (e) {
+    ElMessage.error(`上传失败: ${e}`)
+  }
+}
+
+const removeAttachment = (index: number) => {
+  attachedFiles.value.splice(index, 1)
+}
+
 /** 更加鲁棒的解析函数 */
-const parseMessage = (msg: {role: string, content: string, id?: string}): Message => {
-    const base: Message = { 
-        id: msg.id || Date.now().toString(), 
-        role: msg.role as any, 
-        content: msg.content 
+const parseMessage = (msg: { role: string, content: string, id?: string }): Message => {
+  const base: Message = {
+    id: msg.id || Date.now().toString(),
+    role: msg.role as any,
+    content: msg.content
+  }
+  if (msg.role !== 'assistant') {
+    return { ...base, answer: msg.content };
+  }
+
+  // 支持不区分大小写、空格以及转义字符: <think> or &lt;think&gt;
+  const thinkRegex = /(?:<\s*think\s*>|&lt;\s*think\s*&gt;)([\s\S]*?)(?:<\/\s*think\s*>|&lt;\/\s*think\s*&gt;)/i
+  const match = msg.content.match(thinkRegex)
+
+  if (match) {
+    return {
+      ...base,
+      thinking: match[1].trim(),
+      answer: msg.content.replace(thinkRegex, '').trim()
     }
-    if (msg.role !== 'assistant') {
-        return { ...base, answer: msg.content };
-    }
-    
-    // 支持不区分大小写、空格以及转义字符: <think> or &lt;think&gt;
-    const thinkRegex = /(?:<\s*think\s*>|&lt;\s*think\s*&gt;)([\s\S]*?)(?:<\/\s*think\s*>|&lt;\/\s*think\s*&gt;)/i
-    const match = msg.content.match(thinkRegex)
-    
-    if (match) {
-        return {
-            ...base,
-            thinking: match[1].trim(),
-            answer: msg.content.replace(thinkRegex, '').trim()
-        }
-    }
-    return { ...base, answer: msg.content }
+  }
+  return { ...base, answer: msg.content }
 }
 
 // ========== 知识库文档 ==========
@@ -209,13 +314,23 @@ onMounted(async () => {
     console.warn('加载本地对话失败:', e)
   }
 
+  // 3. 获取 AI 配置，判断是否显示高级选项
+  try {
+    const aiConfig = await invoke<any>('get_ai_settings')
+    currentAiProvider.value = aiConfig?.provider || ''
+  } catch (e) {
+    console.warn('load ai settings:', e)
+  }
+
   await refreshDocuments()
 })
 
 // ========== 对话逻辑 ==========
 const handleSend = async () => {
   const text = inputText.value.trim()
-  if (!text || isLoading.value) return
+  if (!text || isCurrentLoading.value) return
+
+  stopStreamFlag = false
 
   // 如果没有对话，创建一个
   if (!activeConversationId.value) {
@@ -226,93 +341,155 @@ const handleSend = async () => {
       title: convTitle,
       time: new Date().toLocaleTimeString()
     }
-    
+
     try {
       await invoke('save_conversation', { id: convId, title: convTitle })
-    } catch(e) {
+    } catch (e) {
       console.error('保存新会话失败', e)
     }
-    
+
     conversations.value.unshift(conv)
     activeConversationId.value = conv.id
     messages.value = []
   }
 
-  // 1. 屏幕新增打字并落库
+  // 1. 屏幕新增用户消息并落库
   const msgId = Date.now().toString()
   messages.value.push(parseMessage({
     id: msgId,
     role: 'user',
     content: text
   }))
-  
+
   try {
-    await invoke('save_message', { 
-      id: msgId, 
-      sessionId: activeConversationId.value, 
-      role: 'user', 
-      content: text 
+    await invoke('save_message', {
+      id: msgId,
+      sessionId: activeConversationId.value,
+      role: 'user',
+      content: text
     })
-  } catch(e) {
+  } catch (e) {
     console.error('保存用户消息失败', e)
   }
+
+  // 收集附件并清空
+  const currentAttachments = attachedFiles.value.map(a => ({
+    file_id: a.fileId,
+    file_type: a.fileType,
+    file_name: a.fileName,
+  }))
+  attachedFiles.value = []
   inputText.value = ''
+
   const currentSessionId = activeConversationId.value
   loadingMap[currentSessionId] = true
   await scrollToBottom()
 
+  // 流式响应的消息（在收到第一个 chunk 时再推入）
+  const replyId = (Date.now() + 1).toString()
+  const streamMsg: Message = {
+    id: replyId,
+    role: 'assistant',
+    content: '',
+    thinking: '',
+    answer: '',
+  }
+
+  // 设置流式监听
+  let streamFullText = ''
+  let streamThinking = ''
+  let streamStarted = false
+  let msgProxy: Message = streamMsg // 初始指向原始对象，push 后重新指向 proxy
+  const unlisten = await listen<any>('ai-stream-chunk', (event) => {
+    const chunk = event.payload
+    if (chunk.session_id !== currentSessionId) return
+
+    if (chunk.done) {
+      return
+    }
+
+    // 检查是否被用户中断
+    if (stopStreamFlag) return
+
+    // 第一个 chunk 到来时，关闭 loading 并推入消息
+    if (!streamStarted) {
+      streamStarted = true
+      loadingMap[currentSessionId] = false
+      if (activeConversationId.value === currentSessionId) {
+        messages.value.push(streamMsg)
+        // 取回 reactive proxy 引用，确保后续修改能触发 Vue re-render
+        msgProxy = messages.value[messages.value.length - 1]
+      }
+    }
+
+    if (chunk.chunk_type === 'text') {
+      streamFullText += chunk.delta
+      msgProxy.answer = streamFullText
+      msgProxy.content = (streamThinking ? `<think>${streamThinking}</think>\n\n` : '') + streamFullText
+    } else if (chunk.chunk_type === 'thinking') {
+      streamThinking += chunk.delta
+      msgProxy.thinking = streamThinking
+    }
+
+    triggerRef(messages)
+    scrollToBottom()
+  })
+
   try {
-    // 上下文管理（短期记忆）：过滤有效消息，并仅截取最近 10 条（5轮交互）作为上下文
-    const validMessages = messages.value.filter(m => m.role === 'user' || m.role === 'assistant')
+    // 上下文管理（短期记忆）
+    const validMessages = messages.value
+      .filter(m => m.role === 'user' || m.role === 'assistant')
+      .filter(m => m.id !== replyId) // 排除刚创建的空消息
     const contextMessages = validMessages.slice(-10).map(m => ({
       role: m.role,
       content: m.content
     }))
-    
+
     console.log('Sending messages to AI:', contextMessages)
-    const reply = await invoke<string>('chat_with_ai', { 
-        messages: contextMessages,
-        sessionId: currentSessionId,
-        enableWebSearch: isWebSearchEnabled.value,
-        thinkingDepth: thinkingDepth.value !== 'none' ? thinkingDepth.value : null
+    const reply = await invoke<string>('chat_with_ai', {
+      messages: contextMessages,
+      sessionId: currentSessionId,
+      enableWebSearch: isWebSearchEnabled.value,
+      thinkingDepth: thinkingDepth.value !== 'none' ? thinkingDepth.value : null,
+      attachments: currentAttachments.length > 0 ? currentAttachments : null,
     })
-    console.log('Received AI reply:', reply)
-    const replyId = (Date.now() + 1).toString()
-    
-    // 只有当当前活跃的对话还是发送时的那个对话时，才推入内存列表
-    // 否则，用户切换回来时会通过 switchConversation 重新从数据库加载新保存的消息
-    if (activeConversationId.value === currentSessionId) {
-      messages.value.push(parseMessage({
-        id: replyId,
-        role: 'assistant',
-        content: reply
-      }))
+
+    // 对于非流式 Provider，reply 是完整文本
+    // 对于豆包(流式)，reply 也是完整文本（流式 callback 已实时填充）
+    // 确保最终 streamMsg.content 有值
+    if (!streamStarted && reply) {
+      // 非流式情况下，用完整 reply 填充并推入列表
+      const parsed = parseMessage({ id: replyId, role: 'assistant', content: reply })
+      streamMsg.content = parsed.content
+      streamMsg.thinking = parsed.thinking
+      streamMsg.answer = parsed.answer
+      if (activeConversationId.value === currentSessionId) {
+        messages.value.push(streamMsg)
+      }
     }
-    
+
     // AI 回复落库
     try {
-      await invoke('save_message', { 
-        id: replyId, 
-        sessionId: currentSessionId, 
-        role: 'assistant', 
-        content: reply 
+      await invoke('save_message', {
+        id: replyId,
+        sessionId: currentSessionId,
+        role: 'assistant',
+        content: streamMsg.content || reply
       })
-      // 刷新一下标题的时间展示
       const c = conversations.value.find(c => c.id === currentSessionId)
       if (c) c.time = new Date().toLocaleTimeString()
-    } catch(e) {
+    } catch (e) {
       console.error('保存AI消息失败', e)
     }
-    
+
   } catch (e) {
-    if (activeConversationId.value === currentSessionId) {
-      messages.value.push(parseMessage({
-        id: (Date.now() + 1).toString(),
-        role: 'system',
-        content: `错误: ${e}`
-      }))
+    // 如果流式没有接收到任何文本，显示错误
+    if (!streamFullText) {
+      streamMsg.content = `错误: ${e}`
+      streamMsg.answer = `错误: ${e}`
     }
   } finally {
+    unlisten()
     loadingMap[currentSessionId] = false
     await scrollToBottom()
   }
@@ -340,7 +517,7 @@ const switchConversation = async (conv: Conversation) => {
       role: m.role,
       content: m.content
     }))
-  } catch(e) {
+  } catch (e) {
     console.error('拉取历史消息失败', e)
   }
   scrollToBottom()
@@ -358,8 +535,43 @@ const deleteConversation = async (id: string) => {
       }
     }
     ElMessage.success('会话已删除')
-  } catch(e) {
+  } catch (e) {
     ElMessage.error(`删除失败: ${e}`)
+  }
+}
+
+// ========== 对话标题编辑 ==========
+const currentChatTitle = computed(() => {
+  const c = conversations.value.find(c => c.id === activeConversationId.value)
+  return c ? c.title : '新对话'
+})
+const isEditingTitle = ref(false)
+const editTitleValue = ref('')
+
+const startEditTitle = () => {
+  if (activeConversationId.value) {
+    editTitleValue.value = currentChatTitle.value
+    isEditingTitle.value = true
+    nextTick(() => {
+      document.getElementById('titleInput')?.focus()
+    })
+  }
+}
+
+const saveTitle = async () => {
+  if (!isEditingTitle.value) return
+  isEditingTitle.value = false
+  const newTitle = editTitleValue.value.trim()
+  if (newTitle && newTitle !== currentChatTitle.value) {
+    const c = conversations.value.find(c => c.id === activeConversationId.value)
+    if (c) {
+      c.title = newTitle
+      try {
+        await invoke('save_conversation', { id: c.id, title: newTitle })
+      } catch (e) {
+        console.error('更新标题失败', e)
+      }
+    }
   }
 }
 
@@ -426,20 +638,12 @@ const handleDeleteDoc = async (id: string) => {
       </div>
 
       <div class="sidebar-content">
-        <div class="new-chat-btn" @click="startNewChat">
-          <el-icon><Plus /></el-icon>
-          <span>新对话</span>
-        </div>
-
         <div class="conversation-list">
-          <div
-            v-for="conv in conversations"
-            :key="conv.id"
-            class="conversation-item"
-            :class="{ active: conv.id === activeConversationId }"
-            @click="switchConversation(conv)"
-          >
-            <el-icon><ChatDotRound /></el-icon>
+          <div v-for="conv in conversations" :key="conv.id" class="conversation-item"
+            :class="{ active: conv.id === activeConversationId }" @click="switchConversation(conv)">
+            <el-icon>
+              <ChatDotRound />
+            </el-icon>
             <span class="conv-title" :title="conv.title">{{ conv.title }}</span>
             <el-icon class="conv-delete" @click.stop="deleteConversation(conv.id)" title="删除对话">
               <Delete />
@@ -454,10 +658,54 @@ const handleDeleteDoc = async (id: string) => {
 
     <!-- ========== 中间主区域 ========== -->
     <main class="main-area">
-      <!-- 左侧边栏展开/收起按钮 -->
-      <div class="edge-toggle left-edge" @click="leftCollapsed = !leftCollapsed">
-        <el-icon><Expand v-if="leftCollapsed" /><Fold v-else /></el-icon>
-      </div>
+      <!-- 固定的聊天头部 -->
+      <header class="chat-header">
+        <div class="header-left">
+          <el-tooltip :content="leftCollapsed ? '展开侧栏' : '收起侧栏'" placement="bottom">
+            <div class="control-btn" @click="leftCollapsed = !leftCollapsed">
+              <el-icon>
+                <Expand v-if="leftCollapsed" />
+                <Fold v-else />
+              </el-icon>
+            </div>
+          </el-tooltip>
+          <el-tooltip content="新对话" placement="bottom">
+            <div class="control-btn" @click="startNewChat">
+              <el-icon>
+                <EditPen />
+              </el-icon>
+            </div>
+          </el-tooltip>
+        </div>
+
+        <div class="header-center">
+          <template v-if="activeConversationId">
+            <div v-if="!isEditingTitle" class="chat-title" @click="startEditTitle" title="点击修改标题">
+              {{ currentChatTitle }}
+            </div>
+            <input v-else v-model="editTitleValue" class="title-edit-input" @blur="saveTitle" @keyup.enter="saveTitle"
+              id="titleInput" />
+            <div class="chat-subtitle">内容由 AI 生成</div>
+          </template>
+          <template v-else>
+            <div class="chat-title">新对话</div>
+            <div class="chat-subtitle">有什么我能帮你的吗？</div>
+          </template>
+        </div>
+
+        <div class="header-right">
+          <el-icon class="control-btn">
+            <Phone />
+          </el-icon>
+          <el-icon class="control-btn">
+            <CopyDocument />
+          </el-icon>
+          <el-icon class="control-btn" @click="rightCollapsed = !rightCollapsed"
+            :title="rightCollapsed ? '展开知识库' : '收起知识库'">
+            <More />
+          </el-icon>
+        </div>
+      </header>
 
       <!-- 消息区域 -->
       <div ref="chatAreaRef" class="chat-area">
@@ -469,30 +717,17 @@ const handleDeleteDoc = async (id: string) => {
 
         <!-- 消息列表 -->
         <div v-else class="message-list">
-          <div
-            v-for="msg in messages"
-            :key="msg.id"
-            class="message-row"
-            :class="msg.role"
-          >
+          <div v-for="msg in messages" :key="msg.id" class="message-row" :class="msg.role">
             <div class="message-avatar">
               {{ msg.role === 'user' ? '👤' : '🍃' }}
             </div>
             <div class="message-bubble">
               <div class="message-content">
                 <template v-if="msg.role === 'assistant'">
-                   <Thinking
-                        v-if="msg.thinking"
-                        status="end"
-                        :model-value="false"
-                        :content="msg.thinking"
-                        button-width="180px"
-                        max-width="100%"
-                        background-color="#2a2a2a"
-                        color="#d1d1d1"
-                        style="margin-bottom: 8px;"
-                    />
-                    <div class="answer-text">{{ msg.answer || msg.content }}</div>
+                  <Thinking v-if="msg.thinking" status="end" :model-value="false" :content="msg.thinking"
+                    button-width="180px" max-width="100%" background-color="#2a2a2a" color="#d1d1d1"
+                    style="margin-bottom: 8px;" />
+                  <div class="answer-text markdown-body" v-html="renderMarkdown(msg.answer || msg.content)"></div>
                 </template>
                 <template v-else>{{ msg.answer || msg.content }}</template>
               </div>
@@ -514,77 +749,91 @@ const handleDeleteDoc = async (id: string) => {
       <!-- 底部输入框 -->
       <div class="input-area">
         <div class="input-wrapper">
-          <div class="input-tools">
-            <div 
-              class="pill-btn web-search-btn" 
-              :class="{ active: isWebSearchEnabled }" 
-              @click="isWebSearchEnabled = !isWebSearchEnabled"
-            >
-              <span>🌍 联网</span>
+          <textarea v-model="inputText" class="chat-input" placeholder="发消息或输入 / 选择技能"
+            @keyup.enter.exact.prevent="handleSend" :rows="1" ref="textareaRef"
+            @input="adjustTextareaHeight"></textarea>
+
+          <!-- 附件标签展示 -->
+          <div v-if="attachedFiles.length > 0" class="attachments-bar">
+            <div v-for="(att, index) in attachedFiles" :key="att.fileId" class="attachment-tag">
+              <span class="att-icon">{{ att.fileType === 'video' ? '🎬' : '📎' }}</span>
+              <span class="att-name">{{ att.fileName }}</span>
+              <span class="att-remove" @click="removeAttachment(index)">×</span>
+            </div>
+          </div>
+
+          <div class="input-tools-row">
+            <div class="input-tools-left">
+              <div class="action-btn" @click="handleChatUploadVideo">
+                <el-icon>
+                  <Lightning />
+                </el-icon>
+                <span>视频转写</span>
+              </div>
+
+              <div class="action-btn" @click="handleChatUploadFile">
+                <el-icon>
+                  <Paperclip />
+                </el-icon>
+                <span>上传文件</span>
+              </div>
+
+              <template v-if="isDoubao">
+                <div class="pill-btn web-search-btn" :class="{ active: isWebSearchEnabled }"
+                  @click="isWebSearchEnabled = !isWebSearchEnabled">
+                  <span>🌍 联网</span>
+                </div>
+
+                <el-dropdown trigger="click" @command="handleThinkingDepth">
+                  <div class="pill-btn dropdown-trigger" :class="{ active: thinkingDepth !== 'none' }">
+                    <span>🧠 深度思考: {{ thinkingDepthLabel }}</span>
+                    <el-icon class="el-icon--right">
+                      <ArrowDown />
+                    </el-icon>
+                  </div>
+                  <template #dropdown>
+                    <el-dropdown-menu>
+                      <el-dropdown-item command="none"
+                        :class="{ 'is-active': thinkingDepth === 'none' }">关闭</el-dropdown-item>
+                      <el-dropdown-item command="low"
+                        :class="{ 'is-active': thinkingDepth === 'low' }">低</el-dropdown-item>
+                      <el-dropdown-item command="medium"
+                        :class="{ 'is-active': thinkingDepth === 'medium' }">中</el-dropdown-item>
+                      <el-dropdown-item command="high"
+                        :class="{ 'is-active': thinkingDepth === 'high' }">高</el-dropdown-item>
+                    </el-dropdown-menu>
+                  </template>
+                </el-dropdown>
+              </template>
             </div>
 
-            <el-dropdown trigger="click" @command="handleThinkingDepth">
-              <div class="pill-btn dropdown-trigger" :class="{ active: thinkingDepth !== 'none' }">
-                <span>🧠 思考深度: {{ thinkingDepthLabel }}</span>
-                <el-icon class="el-icon--right"><ArrowDown /></el-icon>
+            <div class="input-tools-right">
+              <div v-if="isCurrentLoading" class="send-btn stop-btn active" @click="handleStopGenerate" title="停止生成">
+                <span style="font-size: 18px; line-height: 1;">⏹</span>
               </div>
-              <template #dropdown>
-                <el-dropdown-menu>
-                  <el-dropdown-item command="none" :class="{ 'is-active': thinkingDepth === 'none' }">关闭</el-dropdown-item>
-                  <el-dropdown-item command="low" :class="{ 'is-active': thinkingDepth === 'low' }">低</el-dropdown-item>
-                  <el-dropdown-item command="medium" :class="{ 'is-active': thinkingDepth === 'medium' }">中</el-dropdown-item>
-                  <el-dropdown-item command="high" :class="{ 'is-active': thinkingDepth === 'high' }">高</el-dropdown-item>
-                </el-dropdown-menu>
-              </template>
-            </el-dropdown>
-
-            <el-tooltip content="上传文档" placement="top">
-              <el-icon class="tool-btn" @click="handleUploadFile"><Document /></el-icon>
-            </el-tooltip>
-            <el-tooltip content="视频转写" placement="top">
-              <el-icon class="tool-btn" @click="handleUploadVideo"><VideoPlay /></el-icon>
-            </el-tooltip>
+              <div v-else class="send-btn" :class="{ active: inputText.trim() }" @click="handleSend">
+                <el-icon>
+                  <Top />
+                </el-icon>
+              </div>
+            </div>
           </div>
-          <input
-            v-model="inputText"
-            class="chat-input"
-            placeholder="发消息或输入 / 选择技能"
-            @keyup.enter="handleSend"
-          />
-          <el-icon
-            class="send-btn"
-            :class="{ active: inputText.trim() }"
-            @click="handleSend"
-          >
-            <Position />
-          </el-icon>
         </div>
       </div>
 
-      <!-- 右侧边栏展开/收起按钮 -->
-      <div class="edge-toggle right-edge" @click="rightCollapsed = !rightCollapsed">
-        <el-icon><Fold v-if="rightCollapsed" /><Expand v-else /></el-icon>
-      </div>
     </main>
 
     <!-- ========== 右侧边栏：知识库 ========== -->
     <aside class="sidebar sidebar-right" :class="{ collapsed: rightCollapsed }">
       <div class="sidebar-header">
-        <span class="sidebar-title">知识库</span>
+        <span class="sidebar-title">本地知识库</span>
       </div>
 
       <div class="sidebar-content">
         <!-- 搜索框 -->
         <div class="kb-search">
-          <el-input
-            v-model="searchQuery"
-            placeholder="搜索知识库..."
-            :prefix-icon="Search"
-            clearable
-            size="small"
-            @input="handleSearch"
-            @clear="clearSearch"
-          />
+          <el-input v-model="searchQuery" placeholder="搜索知识库..." :prefix-icon="Search" clearable size="small"
+            @input="handleSearch" @clear="clearSearch" />
         </div>
 
         <!-- 搜索结果 -->
@@ -595,12 +844,8 @@ const handleDeleteDoc = async (id: string) => {
           </div>
           <div v-if="isSearching" class="empty-hint">搜索中...</div>
           <div v-else-if="searchResults.length === 0" class="empty-hint">未找到匹配内容</div>
-          <div
-            v-for="result in searchResults"
-            :key="result.document.id"
-            class="search-result-item"
-            @click="showDocDetail(result.document)"
-          >
+          <div v-for="result in searchResults" :key="result.document.id" class="search-result-item"
+            @click="showDocDetail(result.document)">
             <div class="sr-title">
               <span class="kb-emoji-icon">{{ getDocIcon(result.document) }}</span>
               <span class="sr-name">{{ result.document.name }}</span>
@@ -614,20 +859,19 @@ const handleDeleteDoc = async (id: string) => {
         <template v-else>
           <div class="kb-actions">
             <el-button size="small" @click="handleUploadFile">
-              <el-icon><Document /></el-icon>添加文档
+              <el-icon>
+                <Document />
+              </el-icon>添加文档
             </el-button>
             <el-button size="small" @click="handleUploadVideo">
-              <el-icon><VideoPlay /></el-icon>视频转写
+              <el-icon>
+                <VideoPlay />
+              </el-icon>视频转写
             </el-button>
           </div>
 
           <div class="kb-list">
-            <div
-              v-for="doc in kbDocuments"
-              :key="doc.id"
-              class="kb-item clickable"
-              @click="showDocDetail(doc)"
-            >
+            <div v-for="doc in kbDocuments" :key="doc.id" class="kb-item clickable" @click="showDocDetail(doc)">
               <span class="kb-emoji-icon">{{ getDocIcon(doc) }}</span>
               <span class="kb-name" :title="doc.name">{{ doc.name }}</span>
               <el-icon class="kb-delete" @click.stop="handleDeleteDoc(doc.id)">
@@ -645,29 +889,19 @@ const handleDeleteDoc = async (id: string) => {
     <VideoTranscriptDialog ref="videoDialogRef" @saved="refreshDocuments" />
 
     <!-- 文档详情对话框 -->
-    <el-dialog v-model="detailDialogVisible" :title="selectedDoc?.name || '文档详情'" width="60%" class="doc-preview-dialog">
+    <el-dialog v-model="detailDialogVisible" :title="selectedDoc?.name || '文档详情'" width="60%"
+      class="doc-preview-dialog">
       <div v-if="selectedDoc" class="doc-detail-content">
         <div class="doc-meta-bar">
           <el-tag size="small" :type="selectedDoc.category === 'video-transcript' ? 'warning' : 'info'">
             {{ getDocTag(selectedDoc) }}
           </el-tag>
-          <el-button
-            v-if="canOpenExternal(selectedDoc)"
-            size="small"
-            type="primary"
-            plain
-            @click="handleOpenFile(selectedDoc)"
-          >
+          <el-button v-if="canOpenExternal(selectedDoc)" size="small" type="primary" plain
+            @click="handleOpenFile(selectedDoc)">
             用系统程序打开原件
           </el-button>
         </div>
-        <el-input
-          :model-value="selectedDoc.content"
-          type="textarea"
-          :rows="18"
-          readonly
-          class="detail-textarea"
-        />
+        <el-input :model-value="selectedDoc.content" type="textarea" :rows="18" readonly class="detail-textarea" />
       </div>
       <template #footer>
         <el-button @click="detailDialogVisible = false">关闭</el-button>
@@ -680,6 +914,7 @@ const handleDeleteDoc = async (id: string) => {
 .web-search-btn {
   color: #888;
 }
+
 .web-search-btn.active {
   color: #4facfe;
   border-color: rgba(79, 172, 254, 0.4);
@@ -690,12 +925,13 @@ const handleDeleteDoc = async (id: string) => {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  padding: 4px 10px;
-  border-radius: 16px;
+  padding: 6px 12px;
+  border-radius: 18px;
   border: 1px solid rgba(255, 255, 255, 0.1);
   background: rgba(255, 255, 255, 0.02);
   color: #888;
-  font-size: 0.85rem;
+  font-size: 0.82rem;
+  font-weight: 500;
   cursor: pointer;
   transition: all 0.2s;
   user-select: none;
@@ -709,6 +945,7 @@ const handleDeleteDoc = async (id: string) => {
 .dropdown-trigger {
   outline: none;
 }
+
 .dropdown-trigger.active {
   color: #a450ff;
   border-color: rgba(164, 80, 255, 0.4);
@@ -734,7 +971,7 @@ const handleDeleteDoc = async (id: string) => {
   display: flex;
   flex-direction: column;
   background-color: #16163a;
-  border-right: 1px solid rgba(255,255,255,0.06);
+  border-right: 1px solid rgba(255, 255, 255, 0.06);
   transition: width 0.25s ease;
   width: 260px;
   flex-shrink: 0;
@@ -748,7 +985,7 @@ const handleDeleteDoc = async (id: string) => {
 
 .sidebar-right {
   border-right: none;
-  border-left: 1px solid rgba(255,255,255,0.06);
+  border-left: 1px solid rgba(255, 255, 255, 0.06);
 }
 
 .sidebar-header {
@@ -756,7 +993,7 @@ const handleDeleteDoc = async (id: string) => {
   align-items: center;
   padding: 16px 12px;
   gap: 10px;
-  border-bottom: 1px solid rgba(255,255,255,0.06);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
   min-height: 56px;
   white-space: nowrap;
 }
@@ -793,60 +1030,87 @@ const handleDeleteDoc = async (id: string) => {
   padding: 12px 8px;
 }
 
-/* ========== 边缘切换按钮 ========== */
-.main-area {
-  position: relative;
-}
-
-.edge-toggle {
-  position: absolute;
-  top: 50%;
-  transform: translateY(-50%);
-  width: 20px;
-  height: 48px;
+/* ========== 固定聊天头部 ========== */
+.chat-header {
   display: flex;
   align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  color: #555;
+  justify-content: space-between;
+  padding: 12px 24px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+  background: transparent;
   z-index: 10;
-  border-radius: 6px;
-  transition: all 0.2s;
-  background: rgba(255,255,255,0.03);
+  flex-shrink: 0;
 }
 
-.edge-toggle:hover {
-  color: #e3e3e3;
-  background: rgba(255,255,255,0.08);
-}
-
-.edge-toggle.left-edge {
-  left: 2px;
-}
-
-.edge-toggle.right-edge {
-  right: 2px;
-}
-
-/* ========== 左侧 - 新对话按钮 ========== */
-.new-chat-btn {
+.header-left,
+.header-right {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 10px 14px;
-  margin-bottom: 12px;
-  border-radius: 10px;
+  width: 120px;
+}
+
+.header-right {
+  justify-content: flex-end;
+}
+
+.header-center {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+
+.chat-title {
+  font-size: 1rem;
+  font-weight: 600;
+  color: #e3e3e3;
   cursor: pointer;
-  color: #ccc;
-  font-size: 0.9rem;
-  border: 1px dashed rgba(255,255,255,0.15);
+  padding: 2px 8px;
+  border-radius: 6px;
+  transition: background 0.2s;
+}
+
+.chat-title:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.title-edit-input {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(79, 172, 254, 0.4);
+  color: #e3e3e3;
+  font-size: 1rem;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 6px;
+  outline: none;
+  text-align: center;
+  width: 200px;
+  font-family: inherit;
+}
+
+.chat-subtitle {
+  font-size: 0.75rem;
+  color: #888;
+  margin-top: 2px;
+}
+
+.control-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 6px;
+  cursor: pointer;
+  color: #adb5bd;
   transition: all 0.2s;
 }
 
-.new-chat-btn:hover {
-  background: rgba(79, 172, 254, 0.1);
-  border-color: rgba(79, 172, 254, 0.3);
-  color: #4facfe;
+.control-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: #e3e3e3;
 }
 
 /* ========== 左侧 - 对话列表 ========== */
@@ -871,7 +1135,7 @@ const handleDeleteDoc = async (id: string) => {
 }
 
 .conversation-item:hover {
-  background: rgba(255,255,255,0.06);
+  background: rgba(255, 255, 255, 0.06);
   color: #e3e3e3;
 }
 
@@ -919,7 +1183,7 @@ const handleDeleteDoc = async (id: string) => {
 .chat-area {
   flex: 1;
   overflow-y: auto;
-  padding: 32px 24px 16px;
+  padding: 16px 24px 16px;
   display: flex;
   flex-direction: column;
 }
@@ -977,7 +1241,7 @@ const handleDeleteDoc = async (id: string) => {
   align-items: center;
   justify-content: center;
   font-size: 1.1rem;
-  background: rgba(255,255,255,0.06);
+  background: rgba(255, 255, 255, 0.06);
   flex-shrink: 0;
 }
 
@@ -996,7 +1260,7 @@ const handleDeleteDoc = async (id: string) => {
 }
 
 .message-row.assistant .message-bubble {
-  background: rgba(255,255,255,0.06);
+  background: rgba(255, 255, 255, 0.06);
   border-bottom-left-radius: 4px;
 }
 
@@ -1015,36 +1279,62 @@ const handleDeleteDoc = async (id: string) => {
   animation: bounce 1.4s infinite ease-in-out both;
 }
 
-.typing-indicator span:nth-child(1) { animation-delay: -0.32s; }
-.typing-indicator span:nth-child(2) { animation-delay: -0.16s; }
-.typing-indicator span:nth-child(3) { animation-delay: 0s; }
+.typing-indicator span:nth-child(1) {
+  animation-delay: -0.32s;
+}
+
+.typing-indicator span:nth-child(2) {
+  animation-delay: -0.16s;
+}
+
+.typing-indicator span:nth-child(3) {
+  animation-delay: 0s;
+}
 
 @keyframes bounce {
-  0%, 80%, 100% { transform: scale(0.6); opacity: 0.4; }
-  40% { transform: scale(1); opacity: 1; }
+
+  0%,
+  80%,
+  100% {
+    transform: scale(0.6);
+    opacity: 0.4;
+  }
+
+  40% {
+    transform: scale(1);
+    opacity: 1;
+  }
 }
 
 @keyframes fadeIn {
-  from { opacity: 0; transform: translateY(8px); }
-  to { opacity: 1; transform: translateY(0); }
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 /* ========== 底部输入框 ========== */
 .input-area {
   padding: 12px 24px 20px;
-  border-top: 1px solid rgba(255,255,255,0.04);
+  border-top: 1px solid rgba(255, 255, 255, 0.04);
 }
 
 .input-wrapper {
   display: flex;
-  align-items: center;
+  flex-direction: column;
   gap: 12px;
   max-width: 780px;
   margin: 0 auto;
   background: #22223a;
-  border: 1px solid rgba(255,255,255,0.1);
-  border-radius: 20px;
-  padding: 8px 16px;
+  color: #e3e3e3;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 16px;
+  padding: 16px;
   transition: border-color 0.2s;
 }
 
@@ -1052,56 +1342,145 @@ const handleDeleteDoc = async (id: string) => {
   border-color: rgba(79, 172, 254, 0.4);
 }
 
-.input-tools {
-  display: flex;
-  gap: 6px;
-}
-
-.tool-btn {
-  font-size: 1.6rem;
-  color: #888;
-  cursor: pointer;
-  padding: 6px;
-  border-radius: 8px;
-  transition: all 0.2s;
-}
-
-.tool-btn:hover {
-  color: #4facfe;
-  background: rgba(79, 172, 254, 0.1);
-}
-
 .chat-input {
-  flex: 1;
+  width: 100%;
   background: transparent;
   border: none;
   outline: none;
   color: #e3e3e3;
   font-size: 0.95rem;
-  padding: 6px 0;
+  line-height: 1.5;
   font-family: inherit;
+  resize: none;
+  max-height: 180px;
+  padding: 0;
 }
 
 .chat-input::placeholder {
   color: #555;
 }
 
-.send-btn {
-  font-size: 1.6rem;
-  color: #555;
-  cursor: pointer;
-  padding: 6px;
+.attachments-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.attachment-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
   border-radius: 8px;
+  background: rgba(79, 172, 254, 0.1);
+  border: 1px solid rgba(79, 172, 254, 0.2);
+  font-size: 0.8rem;
+  color: #bbb;
+}
+
+.att-icon {
+  font-size: 0.9rem;
+}
+
+.att-name {
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.att-remove {
+  cursor: pointer;
+  color: #888;
+  font-size: 1rem;
+  line-height: 1;
+  margin-left: 2px;
+}
+
+.att-remove:hover {
+  color: #ff4d4f;
+}
+
+.input-tools-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.input-tools-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.input-tools-right {
+  display: flex;
+  align-items: center;
+}
+
+.action-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: #888;
+  cursor: pointer;
+  padding: 6px 12px;
+  border-radius: 18px;
+  font-size: 0.82rem;
+  transition: all 0.2s;
+  user-select: none;
+  font-weight: 500;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.action-btn .el-icon {
+  font-size: 1rem;
+}
+
+.action-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: #e3e3e3;
+}
+
+.send-btn {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background-color: #e5e5e5;
+  color: #999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: not-allowed;
   transition: all 0.2s;
 }
 
-.send-btn.active {
-  color: #4facfe;
+.send-btn .el-icon {
+  font-size: 1.2rem;
 }
 
-.send-btn:hover {
-  background: rgba(79, 172, 254, 0.1);
+.send-btn.active {
+  background-color: #0066ff;
+  color: #fff;
+  cursor: pointer;
 }
+
+.send-btn.active:hover {
+  background-color: #005ce6;
+}
+
+.send-btn.stop-btn {
+  background-color: #444;
+  color: #fff;
+  cursor: pointer;
+}
+
+.send-btn.stop-btn:hover {
+  background-color: #555;
+}
+
+
 
 /* ========== 右侧 - 知识库 ========== */
 .kb-actions {
@@ -1114,7 +1493,7 @@ const handleDeleteDoc = async (id: string) => {
 .kb-actions .el-button {
   justify-content: flex-start;
   background: transparent;
-  border: 1px dashed rgba(255,255,255,0.12);
+  border: 1px dashed rgba(255, 255, 255, 0.12);
   color: #aaa;
 }
 
@@ -1128,8 +1507,8 @@ const handleDeleteDoc = async (id: string) => {
 }
 
 .kb-search :deep(.el-input__wrapper) {
-  background: rgba(255,255,255,0.04);
-  border-color: rgba(255,255,255,0.08);
+  background: rgba(255, 255, 255, 0.04);
+  border-color: rgba(255, 255, 255, 0.08);
   border-radius: 10px;
 }
 
@@ -1161,7 +1540,7 @@ const handleDeleteDoc = async (id: string) => {
   border-radius: 10px;
   cursor: pointer;
   transition: all 0.15s;
-  border: 1px solid rgba(255,255,255,0.04);
+  border: 1px solid rgba(255, 255, 255, 0.04);
 }
 
 .search-result-item:hover {
@@ -1221,7 +1600,7 @@ const handleDeleteDoc = async (id: string) => {
 }
 
 .kb-item:hover {
-  background: rgba(255,255,255,0.05);
+  background: rgba(255, 255, 255, 0.05);
 }
 
 .kb-item.clickable {
@@ -1277,10 +1656,12 @@ const handleDeleteDoc = async (id: string) => {
 .kb-delete:hover {
   color: #f56c6c;
 }
+
 /* ========== Thinking 组件暗色适配 ========== */
 :deep(.el-thinking) {
   width: fit-content;
-  margin: 0 !important; /* 强制左对齐，防止展开后居中 */
+  margin: 0 !important;
+  /* 强制左对齐，防止展开后居中 */
   margin-bottom: 12px !important;
 }
 
@@ -1328,12 +1709,135 @@ const handleDeleteDoc = async (id: string) => {
   line-height: 1.6 !important;
   padding: 12px !important;
   border-radius: 8px !important;
-  box-shadow: inset 0 2px 4px rgba(0,0,0,0.2) !important;
+  box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.2) !important;
 }
 
-/* 消息内容调整 */
-.answer-text {
-  word-break: break-all;
-  white-space: pre-wrap;
+/* ========== Markdown 渲染样式 ========== */
+.answer-text.markdown-body {
+  word-break: break-word;
+  line-height: 1.7;
+  color: #e3e3e3;
+}
+
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3,
+.markdown-body h4 {
+  margin: 16px 0 8px;
+  font-weight: 600;
+  color: #f0f0f0;
+  line-height: 1.4;
+}
+
+.markdown-body h1 {
+  font-size: 1.4em;
+}
+
+.markdown-body h2 {
+  font-size: 1.25em;
+}
+
+.markdown-body h3 {
+  font-size: 1.1em;
+}
+
+.markdown-body h4 {
+  font-size: 1em;
+}
+
+.markdown-body p {
+  margin: 8px 0;
+}
+
+.markdown-body ul,
+.markdown-body ol {
+  padding-left: 1.5em;
+  margin: 8px 0;
+}
+
+.markdown-body li {
+  margin: 4px 0;
+}
+
+.markdown-body li>p {
+  margin: 4px 0;
+}
+
+.markdown-body code {
+  background: rgba(255, 255, 255, 0.08);
+  color: #e8b86d;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 0.88em;
+  font-family: 'Cascadia Code', 'Fira Code', Consolas, monospace;
+}
+
+.markdown-body pre {
+  background: #141422;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  padding: 14px;
+  margin: 12px 0;
+  overflow-x: auto;
+}
+
+.markdown-body pre code {
+  background: none;
+  color: #d1d1d1;
+  padding: 0;
+  font-size: 0.85em;
+  line-height: 1.6;
+}
+
+.markdown-body blockquote {
+  border-left: 3px solid rgba(79, 172, 254, 0.5);
+  padding: 4px 12px;
+  margin: 12px 0;
+  color: #aaa;
+  background: rgba(79, 172, 254, 0.04);
+  border-radius: 0 6px 6px 0;
+}
+
+.markdown-body hr {
+  border: none;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  margin: 16px 0;
+}
+
+.markdown-body table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 12px 0;
+}
+
+.markdown-body th,
+.markdown-body td {
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  padding: 8px 12px;
+  text-align: left;
+}
+
+.markdown-body th {
+  background: rgba(255, 255, 255, 0.05);
+  font-weight: 600;
+}
+
+.markdown-body strong {
+  color: #f5f5f5;
+  font-weight: 600;
+}
+
+.markdown-body a {
+  color: #4facfe;
+  text-decoration: none;
+}
+
+.markdown-body a:hover {
+  text-decoration: underline;
+}
+
+.markdown-body img {
+  max-width: 100%;
+  border-radius: 8px;
 }
 </style>

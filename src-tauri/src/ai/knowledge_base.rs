@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
+use crate::ai::document_parser::extract_text_from_file;
 
 #[derive(Error, Debug)]
 pub enum KbError {
@@ -217,7 +218,11 @@ impl KnowledgeBase {
             if !p.exists() && content.is_none() {
                 return Err(KbError::DocumentNotFound(p.display().to_string()));
             }
-            let parsed_content = if let Some(c) = content { c } else { self.parse_document(p)? };
+            let parsed_content = if let Some(c) = content { 
+                c 
+            } else { 
+                extract_text_from_file(p).map_err(|e| KbError::ParseFailed(e.to_string()))? 
+            };
             let file_name = p.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
             let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
             (parsed_content, file_name, Some(p.to_string_lossy().to_string()), ext)
@@ -299,84 +304,7 @@ impl KnowledgeBase {
         Ok(doc)
     }
 
-    /// 解析文档内容
-    fn parse_document(&self, path: &PathBuf) -> Result<String, KbError> {
-        let extension = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_lowercase())
-            .unwrap_or_default();
 
-        match extension.as_str() {
-            "txt" | "md" => self.parse_txt(path),
-            "docx" => self.parse_docx(path),
-            "doc" => Err(KbError::ParseFailed(
-                "不支持旧版 .doc 格式，请转换为 .docx".to_string(),
-            )),
-            "pdf" => self.parse_pdf(path),
-            _ => Err(KbError::ParseFailed(format!(
-                "不支持的文档格式: {}",
-                extension
-            ))),
-        }
-    }
-
-    fn parse_txt(&self, path: &Path) -> Result<String, KbError> {
-        std::fs::read_to_string(path)
-            .map_err(|e| KbError::ParseFailed(format!("读取文本文件失败: {}", e)))
-    }
-
-    fn parse_docx(&self, path: &Path) -> Result<String, KbError> {
-        use std::fs::File;
-        use std::io::Read;
-        use zip::ZipArchive;
-
-        let file = File::open(path)
-            .map_err(|e| KbError::ParseFailed(format!("打开 DOCX 文件失败: {}", e)))?;
-
-        let mut archive = ZipArchive::new(file)
-            .map_err(|e| KbError::ParseFailed(format!("解析 DOCX 压缩包失败: {}", e)))?;
-
-        let mut document_xml = archive
-            .by_name("word/document.xml")
-            .map_err(|e| KbError::ParseFailed(format!("找不到 document.xml: {}", e)))?;
-
-        let mut xml_content = String::new();
-        document_xml
-            .read_to_string(&mut xml_content)
-            .map_err(|e| KbError::ParseFailed(format!("读取 document.xml 失败: {}", e)))?;
-
-        // 简单的 XML 文本提取 (可以使用 regex 优化，这里复用简单的逻辑)
-        let text = self.extract_text_from_xml(&xml_content);
-
-        if text.trim().is_empty() {
-            return Err(KbError::ParseFailed("文档内容为空".to_string()));
-        }
-
-        Ok(text)
-    }
-
-    fn extract_text_from_xml(&self, xml: &str) -> String {
-        // 简化版 XML 提取，仅提取 <w:t> 内容
-        // 实际使用 regex 会更健壮
-        let regex = regex::Regex::new(r"<w:t[^>]*>([^<]*)</w:t>").unwrap();
-        let mut text = String::new();
-        for cap in regex.captures_iter(xml) {
-            text.push_str(&cap[1]);
-        }
-        text
-    }
-
-    fn parse_pdf(&self, path: &Path) -> Result<String, KbError> {
-        let text = pdf_extract::extract_text(path)
-            .map_err(|e| KbError::ParseFailed(format!("解析 PDF 失败: {}", e)))?;
-
-        if text.trim().is_empty() {
-            return Err(KbError::ParseFailed("PDF 文档内容为空".to_string()));
-        }
-
-        Ok(text)
-    }
 
     /// 搜索相关知识
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>, KbError> {

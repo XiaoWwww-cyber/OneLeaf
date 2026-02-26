@@ -1,12 +1,12 @@
 use crate::ai::knowledge_base::{Document, KnowledgeBase, SearchResult};
-use crate::ai::service::{AiProviderType, AiService, ChatMessage};
+use crate::ai::service::{AiProviderType, AiService, AttachmentInfo, ChatMessage, StreamChunk};
 use crate::utils::paths::get_kb_files_dir;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use tracing::{error, info, warn};
 
 // 全局知识库实例
@@ -103,19 +103,70 @@ pub async fn search_knowledge_base(query: String, limit: usize) -> Result<Vec<Se
     }
 }
 
-/// AI 对话（RAG 模式）
+/// 上传文件到 AI（聊天直传，非知识库）
+#[tauri::command]
+pub async fn upload_file_to_ai(file_path: String) -> Result<String, String> {
+    info!("上传文件到 AI: {}", file_path);
+    let service = AI_SERVICE.lock().clone();
+    
+    // 如果是本地模型，不支持远端上传，返回带标识的本地路径供组装上下文使用
+    if service.provider_type == crate::ai::service::AiProviderType::LmStudio {
+        info!("当前为本地模型，使用本地文本提取策略: {}", file_path);
+        // 先简单测试能否解析，防止对话时才报错
+        let path = std::path::Path::new(&file_path);
+        if let Err(e) = crate::ai::document_parser::extract_text_from_file(path) {
+            return Err(format!("本地文件解析失败: {}", e));
+        }
+        return Ok(format!("LOCAL_FILE:{}", file_path));
+    }
+
+    service
+        .upload_file(&file_path)
+        .await
+        .map_err(|e| format!("文件上传失败: {}", e))
+}
+
+/// AI 对话（RAG 模式 + 流式响应）
 /// 1. 搜索知识库获取上下文
 /// 2. 注入系统提示词
-/// 3. 调用 AI 服务
+/// 3. 调用 AI 服务（豆包走流式 SSE，通过 Tauri Event 推送）
 /// 4. AI 未配置时返回搜索结果摘要
 #[tauri::command]
 pub async fn chat_with_ai(
+    app: AppHandle,
     messages: Vec<ChatMessage>,
     session_id: Option<String>,
     enable_web_search: Option<bool>,
     thinking_depth: Option<String>,
+    attachments: Option<Vec<AttachmentInfo>>,
 ) -> Result<String, String> {
-    info!("AI 对话请求，消息数: {}", messages.len());
+    let raw_attachments = attachments.unwrap_or_default();
+    info!("AI 对话请求，消息数: {}，附件数: {}", messages.len(), raw_attachments.len());
+
+    let sid = session_id.clone().unwrap_or_else(|| "default".to_string());
+    let mut valid_attachments = Vec::new();
+    let mut local_attachments_text = String::new();
+
+    for att in raw_attachments {
+        info!("处理附件: file_id={}, file_type={}, file_name={}", att.file_id, att.file_type, att.file_name);
+        if att.file_id.starts_with("LOCAL_FILE:") {
+            let file_path_str = att.file_id.trim_start_matches("LOCAL_FILE:");
+            info!("本地附件路径: {}", file_path_str);
+            let path = std::path::Path::new(file_path_str);
+            match crate::ai::document_parser::extract_text_from_file(path) {
+                Ok(text) => {
+                    info!("✅ 成功解析本地附件 {}，文本长度: {} 字符", att.file_name, text.len());
+                    local_attachments_text.push_str(&format!("【附件内容 - 文件名: {}】:\n{}\n\n", att.file_name, text));
+                }
+                Err(e) => {
+                    warn!("❌ 无法解析本地附件 {}: {}", file_path_str, e);
+                }
+            }
+        } else {
+            valid_attachments.push(att);
+        }
+    }
+    info!("附件处理完毕: local_text_len={}, valid_cloud_attachments={}", local_attachments_text.len(), valid_attachments.len());
 
     // 1. 获取最后一条用户消息用于 RAG 搜索
     let last_user_msg = messages.last().filter(|m| m.role == "user").map(|m| m.content.clone());
@@ -128,7 +179,6 @@ pub async fn chat_with_ai(
             let doc_count = kb.list_documents().await.map(|d| d.len()).unwrap_or(0);
             info!("执行 RAG 搜索 (当前知识库共 {} 个文档)，查询: {}", doc_count, query);
             
-            // 智能选择搜索方式
             let (results, search_type) = if kb.has_semantic_embedder() {
                 (kb.search(query, 3).await.ok(), "向量语义搜索")
             } else {
@@ -138,18 +188,33 @@ pub async fn chat_with_ai(
             info!("使用 {} 模式进行检索", search_type);
 
             if let Some(results) = results {
-                info!("RAG 搜索完成，找到 {} 条结果", results.len());
-                if !results.is_empty() {
-                    let ctx = results
+                // 相似度阈值过滤：低于 0.6 的结果直接丢弃，避免"矮子里拔将军"
+                let threshold = 0.60_f32;
+                let filtered: Vec<_> = results
+                    .into_iter()
+                    .filter(|r| {
+                        if r.relevance < threshold {
+                            info!("过滤低相关度文档: {} (相关度: {} < {})", r.document.name, r.relevance, threshold);
+                            false
+                        } else {
+                            true
+                        }
+                    })
+                    .collect();
+
+                info!("RAG 搜索完成，阈值过滤后有效结果: {} 条", filtered.len());
+                if !filtered.is_empty() {
+                    let ctx = filtered
                         .iter()
                         .map(|r| {
-                            info!("匹配到文档: {} (相关度: {})", r.document.name, r.relevance);
+                            info!("有效匹配: {} (相关度: {})", r.document.name, r.relevance);
                             format!("【{}】{}", r.document.name, r.snippet)
                         })
                         .collect::<Vec<_>>()
                         .join("\n\n");
-                    Some((ctx, results))
+                    Some((ctx, filtered))
                 } else {
+                    info!("所有结果相关度均低于阈值 {}，退化为普通对话模式", threshold);
                     None
                 }
             } else {
@@ -164,7 +229,7 @@ pub async fn chat_with_ai(
         None
     };
 
-    // --- 增加：长时记忆（RAG 搜索历史聊天记录） ---
+    // --- 长时记忆（RAG 搜索历史聊天记录） ---
     let mut history_context = None;
     if let Some(query) = &last_user_msg {
         if let Some(kb) = &kb_opt {
@@ -224,7 +289,6 @@ pub async fn chat_with_ai(
     }
     
     if !service.is_configured() {
-        // AI 未配置，返回搜索结果摘要
         info!("AI 未配置，返回知识库搜索结果");
         return if let Some((ctx, _results)) = &rag_context {
             Ok(format!("📚 知识库搜索结果：\n\n{}\n\n💡 提示：请在设置中配置 AI 服务以获得智能问答体验。", ctx))
@@ -233,71 +297,130 @@ pub async fn chat_with_ai(
         };
     }
 
-    // 4. 构建系统提示词与上下文（RAG）
+    // 4. 构建系统提示词与上下文
     let mut final_messages = messages.clone();
-    
-    let mut context_prompt = String::from(
-        "你是 OneLeaf 智能知识库助手。请根据提供的参考资料回答用户的问题。\n\n",
-    );
 
-    if let Some((ref ctx, _)) = rag_context {
-        context_prompt.push_str("【知识库参考信息】：\n");
-        context_prompt.push_str(&ctx);
-        context_prompt.push_str("\n\n");
-    } 
-
-    if let Some(ref hist_ctx) = history_context {
-        context_prompt.push_str("【历史跨会话聊天记忆】：\n");
-        context_prompt.push_str(&hist_ctx);
-        context_prompt.push_str("\n\n");
-    }
-
-    if rag_context.is_some() || history_context.is_some() {
-        context_prompt.push_str("(请参考以上知识片段或记忆回答问题。如果参考内容不充足，您可以结合自身知识或者进行联网检索来补充解答。)\n\n");
+    // 有本地附件时，使用极简注入策略（复刻 LM Studio inject-full-content）
+    // 不加冗余系统提示词，直接把文件原文拼在用户消息前面
+    if !local_attachments_text.is_empty() {
+        info!("使用本地附件注入策略 (inject-full-content)，附件文本长度: {} 字符", local_attachments_text.len());
+        if let Some(last_msg) = final_messages.last_mut().filter(|m| m.role == "user") {
+            let original_content = last_msg.content.clone();
+            last_msg.content = format!(
+                "{}\n\n{}", 
+                local_attachments_text.trim(), original_content
+            );
+            info!("已将附件内容注入用户消息，最终长度: {} 字符", last_msg.content.len());
+        }
     } else {
-        // 兜底逻辑：如果搜不到内容片段，但知识库里有文档，把文件名告诉 AI
-        if let Some(kb) = &kb_opt {
-             if let Ok(docs) = kb.list_documents().await {
-                 if !docs.is_empty() {
-                     context_prompt.push_str("\n【提示】：系统中存在以下文档，但由于未加载深度语义模型，全文搜索未能直接定位到匹配的文字片段。请基于常识回答，并告知用户参考这些文档名：\n");
-                     for doc in docs.iter().take(5) {
-                         context_prompt.push_str(&format!("- {}\n", doc.name));
+        // 无本地附件：使用标准 RAG 系统提示词
+        let mut context_prompt = String::from(
+            "你是 OneLeaf 智能知识库助手。\n\
+             请仔细阅读以下【参考知识】，并以此来回答用户的问题。\n\
+             如果【参考知识】中没有与用户问题相关的内容，请忽略这些参考知识，\n\
+             直接使用你自己的基础知识来回答，并向用户说明你是基于通用知识回答的。\n\
+             切勿牵强附会地将不相关的参考知识硬塞进回答中。\n\n",
+        );
+
+        if let Some((ref ctx, _)) = rag_context {
+            context_prompt.push_str("【参考知识】：\n");
+            context_prompt.push_str(ctx);
+            context_prompt.push_str("\n\n");
+        } 
+
+        if let Some(ref hist_ctx) = history_context {
+            context_prompt.push_str("【历史跨会话聊天记忆】：\n");
+            context_prompt.push_str(hist_ctx);
+            context_prompt.push_str("\n\n");
+        }
+
+        if rag_context.is_some() || history_context.is_some() {
+            context_prompt.push_str("(请根据以上内容回答。若参考内容与问题无关或不充分，请结合自身知识回答。)\n\n");
+        } else {
+            if let Some(kb) = &kb_opt {
+                 if let Ok(docs) = kb.list_documents().await {
+                     if !docs.is_empty() {
+                         context_prompt.push_str("\n【提示】：系统中存在以下文档，但由于未加载深度语义模型，全文搜索未能直接定位到匹配的文字片段。请基于常识回答，并告知用户参考这些文档名：\n");
+                         for doc in docs.iter().take(5) {
+                             context_prompt.push_str(&format!("- {}\n", doc.name));
+                         }
                      }
                  }
-             }
+            }
+        }
+
+        info!("最终 context_prompt 长度: {} 字符", context_prompt.len());
+        if let Some(last_msg) = final_messages.last_mut().filter(|m| m.role == "user") {
+            let original_content = last_msg.content.clone();
+            last_msg.content = format!(
+                "{}\n\n=== 用户提问 ===\n{}", 
+                context_prompt, original_content
+            );
+            info!("已将 context_prompt 注入最后一条用户消息，最终长度: {} 字符", last_msg.content.len());
+        } else {
+            final_messages.insert(
+                0,
+                ChatMessage {
+                    role: "system".to_string(),
+                    content: context_prompt,
+                },
+            );
         }
     }
 
-    // LM Studio 及部分本地模型对 system 角色的支持不佳（易导致知识库信息被完全忽略），
-    // 且多轮对话时，单独的 system prompt 注意力权重容易被稀释。
-    // 因此将首段系统提示和搜出的上下文，直接合并至当前轮次的用户提问消息前端，效果最可靠。
-    if let Some(last_msg) = final_messages.last_mut().filter(|m| m.role == "user") {
-        let original_content = last_msg.content.clone();
-        last_msg.content = format!(
-            "{}\n\n=== 用户提问 ===\n{}", 
-            context_prompt, original_content
-        );
-    } else {
-        final_messages.insert(
-            0,
-            ChatMessage {
-                role: "system".to_string(),
-                content: context_prompt,
-            },
-        );
-    }
-
-    // 5. 调用 AI 服务
+    // 5. 调用 AI 服务（豆包走流式，其他走非流式）
     info!("调用 AI 服务...");
     let req_enable_web_search = enable_web_search.unwrap_or(false);
-    match service.chat(final_messages, req_enable_web_search, thinking_depth).await {
-        Ok(response) => {
-            info!("AI 对话成功");
-            Ok(response)
+
+    if service.provider_type == AiProviderType::Doubao {
+        // 豆包：流式 SSE + Tauri Event 推送
+        let app_clone = app.clone();
+        match service
+            .chat_stream(
+                final_messages,
+                valid_attachments,
+                req_enable_web_search,
+                thinking_depth,
+                sid.clone(),
+                move |chunk: StreamChunk| {
+                    let _ = app_clone.emit("ai-stream-chunk", &chunk);
+                },
+            )
+            .await
+        {
+            Ok(full_response) => {
+                info!("AI 流式对话完成");
+                Ok(full_response)
+            }
+            Err(e) => {
+                // 出错时也通知前端结束
+                let _ = app.emit(
+                    "ai-stream-chunk",
+                    &StreamChunk {
+                        session_id: sid,
+                        chunk_type: "text".to_string(),
+                        delta: String::new(),
+                        done: true,
+                    },
+                );
+                error!("AI 流式对话失败: {}", e);
+                Err(format!("AI 对话失败: {}", e))
+            }
         }
-        Err(e) => {
-            error!("AI 对话失败: {}", e);
-            Err(format!("AI 对话失败: {}", e))
+    } else {
+        // 其他 Provider：非流式
+        match service
+            .chat(final_messages, req_enable_web_search, thinking_depth)
+            .await
+        {
+            Ok(response) => {
+                info!("AI 对话成功");
+                Ok(response)
+            }
+            Err(e) => {
+                error!("AI 对话失败: {}", e);
+                Err(format!("AI 对话失败: {}", e))
+            }
         }
     }
 }
@@ -696,8 +819,73 @@ pub async fn download_embedding_model(app: AppHandle) -> Result<(), String> {
 }
 
 async fn search_web_ddg(query: &str) -> Result<String, String> {
+    // 优先用 Bing 国内版（cn.bing.com），DuckDuckGo 在国内被墙
+    match search_web_bing(query).await {
+        Ok(r) if !r.is_empty() => Ok(r),
+        _ => {
+            info!("Bing 搜索失败或无结果，尝试 DuckDuckGo fallback");
+            search_web_ddg_fallback(query).await
+        }
+    }
+}
+
+async fn search_web_bing(query: &str) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let url = format!("https://cn.bing.com/search?q={}&count=5", urlencoding::encode(query));
+    let resp = client.get(&url)
+        .header("Accept-Language", "zh-CN,zh;q=0.9")
+        .send().await.map_err(|e| format!("Bing 请求失败: {}", e))?;
+
+    let html = resp.text().await.map_err(|e| e.to_string())?;
+
+    // Bing 搜索摘要在 <div class="b_caption"><p>...</p></div> 结构中
+    // 或者在 <p class="...b_algoSlug...">...</p> 中
+    let re_caption = regex::Regex::new(r#"(?s)<div\s+class="b_caption"[^>]*>\s*<p[^>]*>(.*?)</p>"#).unwrap();
+    let re_algo = regex::Regex::new(r#"<p[^>]*class="[^"]*b_algoSlug[^"]*"[^>]*>([\s\S]*?)</p>"#).unwrap();
+    let re_tags = regex::Regex::new(r#"<[^>]+>"#).unwrap();
+
+    let mut results = Vec::new();
+
+    // 优先用 b_caption 匹配
+    for cap in re_caption.captures_iter(&html) {
+        let text = cap[1].to_string();
+        let clean = re_tags.replace_all(&text, " ");
+        let final_text = clean_html_entities(&clean);
+        let trimmed = final_text.trim().split_whitespace().collect::<Vec<_>>().join(" ");
+        if !trimmed.is_empty() && trimmed.len() > 15 {
+            results.push(format!("- {}", trimmed));
+        }
+        if results.len() >= 5 { break; }
+    }
+
+    // 如果 b_caption 没匹配到，用 b_algoSlug
+    if results.is_empty() {
+        for cap in re_algo.captures_iter(&html) {
+            let text = cap[1].to_string();
+            let clean = re_tags.replace_all(&text, " ");
+            let final_text = clean_html_entities(&clean);
+            let trimmed = final_text.trim().split_whitespace().collect::<Vec<_>>().join(" ");
+            if !trimmed.is_empty() && trimmed.len() > 15 {
+                results.push(format!("- {}", trimmed));
+            }
+            if results.len() >= 5 { break; }
+        }
+    }
+
+    let joined = results.join("\n");
+    info!("Bing 搜索完成，提取到 {} 条摘要:\n{}", results.len(), joined);
+    Ok(joined)
+}
+
+async fn search_web_ddg_fallback(query: &str) -> Result<String, String> {
     let client = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .timeout(std::time::Duration::from_secs(8))
         .build()
         .map_err(|e| e.to_string())?;
 
@@ -707,7 +895,6 @@ async fn search_web_ddg(query: &str) -> Result<String, String> {
 
     let html = resp.text().await.map_err(|e| e.to_string())?;
     
-    // 匹配搜索结果摘要
     let re = regex::Regex::new(r#"<td class='result-snippet'>([\s\S]*?)</td>"#).unwrap();
     let re_tags = regex::Regex::new(r#"<[^>]+>"#).unwrap();
 
@@ -733,3 +920,14 @@ async fn search_web_ddg(query: &str) -> Result<String, String> {
     Ok(results.join("\n"))
 }
 
+fn clean_html_entities(s: &str) -> String {
+    s.replace("&nbsp;", " ")
+        .replace("&ensp;", " ")
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#x27;", "'")
+        .replace("&#39;", "'")
+        .replace("&#0183;", "·")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+}

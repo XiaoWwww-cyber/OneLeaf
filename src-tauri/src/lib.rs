@@ -56,6 +56,7 @@ pub fn run() {
             commands::ai::add_document_to_kb,
             commands::ai::search_knowledge_base,
             commands::ai::chat_with_ai,
+            commands::ai::upload_file_to_ai,
             commands::ai::list_documents,
             commands::ai::delete_document,
             commands::ai::get_document_content,

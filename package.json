@@ -17,6 +17,7 @@
     "axios": "^1.13.5",
     "element-plus": "^2.13.2",
     "element-plus-x": "^1.1.11",
+    "marked": "^17.0.3",
     "pinia": "^3.0.4",
     "sass": "^1.97.3",
     "sortablejs": "^1.15.6",
