@@ -63,6 +63,33 @@ pub fn init_sidecar(app: &AppHandle) {
     info!("[ASR-GPU] Python: {:?}", python_path);
     info!("[ASR-GPU] Script: {:?}", asr_script);
 
+    // 清理可能残留的 ASR 进程
+    info!("[Sidecar] 扫描残留的 ASR 进程...");
+    let mut sys = sysinfo::System::new_all();
+    for (pid, process) in sys.processes() {
+        let name_str = format!("{:?}", process.name()).to_lowercase();
+        if name_str.contains("python") {
+            let mut should_kill = false;
+
+            let exe_str = format!("{:?}", process.exe()).to_lowercase();
+            if exe_str.contains("python-embed") {
+                should_kill = true;
+            }
+
+            if !should_kill {
+                let cmd_str = format!("{:?}", process.cmd()).to_lowercase();
+                if cmd_str.contains("asr_gpu_server.py") || cmd_str.contains("python-embed") {
+                    should_kill = true;
+                }
+            }
+
+            if should_kill {
+                info!("[Sidecar] 发现残留进程: PID {}, 准备终止", pid);
+                process.kill();
+            }
+        }
+    }
+
     // 启动 ASR GPU 服务
     let mut cmd = Command::new(&python_path);
     cmd.arg("-u") // 强制无缓冲输出
@@ -114,5 +141,46 @@ pub fn init_sidecar(app: &AppHandle) {
         Err(e) => {
             error!("[ASR-GPU] 启动失败: {}", e);
         }
+    }
+}
+
+/// 终止 ASR Sidecar 服务及其子进程
+pub fn kill_sidecar(app: &AppHandle) {
+    let pid_to_kill = {
+        let state = match app.try_state::<SidecarState>() {
+            Some(s) => s,
+            None => return,
+        };
+
+        let x = if let Ok(mut pid_guard) = state.asr_gpu_pid.lock() {
+            let pid = *pid_guard;
+            *pid_guard = None;
+            pid
+        } else {
+            None
+        };
+        x
+    };
+
+    if let Some(pid) = pid_to_kill {
+        info!("[ASR-GPU] 准备终止进程树, PID: {}", pid);
+
+        #[cfg(target_os = "windows")]
+        {
+            let _ = Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .creation_flags(CREATE_NO_WINDOW)
+                .status();
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = Command::new("kill")
+                .arg("-9")
+                .arg(pid.to_string())
+                .status();
+        }
+
+        info!("[ASR-GPU] 进程已请求终止");
     }
 }

@@ -26,6 +26,7 @@ pub struct FulltextResult {
     pub doc_id: String,
     pub score: f32,
     pub snippet: String,
+    pub content: String,
 }
 
 pub struct TantivyIndex {
@@ -187,6 +188,7 @@ impl TantivyIndex {
                 doc_id,
                 score,
                 snippet,
+                content: content.to_string(),
             });
         }
 

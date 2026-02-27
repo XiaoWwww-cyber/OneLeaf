@@ -1,6 +1,7 @@
 // 知识库管理
 
 use crate::ai::onnx_embedder::{EmbedderError, OnnxEmbedder};
+use crate::ai::onnx_reranker::OnnxReranker;
 use crate::ai::tantivy_search::{SearchError, TantivyIndex};
 use crate::ai::vector_db::{VectorDb, VectorDbError};
 use chrono::Utc;
@@ -50,6 +51,8 @@ pub struct Document {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SearchResult {
     pub document: Document,
+    pub chunk_index: usize,
+    pub chunk_content: String,
     pub relevance: f32,
     pub snippet: String,
 }
@@ -88,6 +91,7 @@ impl Embedder {
 pub struct KnowledgeBase {
     vector_db: Arc<VectorDb>,
     embedder: Arc<Embedder>,
+    reranker: Option<Arc<Mutex<OnnxReranker>>>,
     documents: Arc<parking_lot::RwLock<Vec<Document>>>,
     tantivy_index: Arc<TantivyIndex>,
 }
@@ -97,6 +101,7 @@ impl Clone for KnowledgeBase {
         Self {
             vector_db: Arc::clone(&self.vector_db),
             embedder: Arc::clone(&self.embedder),
+            reranker: self.reranker.clone(),
             documents: Arc::clone(&self.documents),
             tantivy_index: Arc::clone(&self.tantivy_index),
         }
@@ -107,6 +112,11 @@ impl KnowledgeBase {
     /// 创建新的知识库实例
     pub fn new(db_path: &Path) -> Result<Self, KbError> {
         Self::with_model_dir(db_path, None)
+    }
+
+    /// 是否启用了重排序器
+    pub fn has_reranker(&self) -> bool {
+        self.reranker.is_some()
     }
 
     /// 创建知识库实例并指定模型目录
@@ -139,12 +149,31 @@ impl KnowledgeBase {
             Arc::new(Embedder::Simple(SimpleEmbedder::new(384)))
         };
 
+        // 尝试加载 Reranker 模型
+        let reranker = if let Some(dir) = model_dir {
+            match OnnxReranker::new(dir) {
+                Ok(rr) => {
+                    tracing::info!("✅ 成功加载 BGE-Reranker 模型: {:?}", dir);
+                    Some(Arc::new(Mutex::new(rr)))
+                }
+                Err(e) => {
+                    tracing::warn!("⚠️ Reranker 模型加载失败，检索将不进入两阶段模式: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // 检查是否有维度不匹配需要重建向量
         let current_dim = embedder.dimension();
         let mut needs_reembed = false;
         if let Ok(db_dim) = vector_db.get_dimension() {
-            if db_dim > 0 && db_dim != current_dim {
-                tracing::warn!("检测到向量维度不匹配 (DB: {}, 当前: {})，将重新生成所有向量", db_dim, current_dim);
+            if db_dim == 0 {
+                tracing::warn!("向量表为空或被重建(可能因为支持 Chunk 升级)，将重新生成所有 Chunk 向量...");
+                needs_reembed = true;
+            } else if db_dim != current_dim {
+                tracing::warn!("检测到向量维度不匹配 (DB: {}, 当前: {})，将重新生成所有 Chunk 向量", db_dim, current_dim);
                 needs_reembed = true;
             }
         }
@@ -171,32 +200,36 @@ impl KnowledgeBase {
                         docs_to_reembed.push((id, name, content));
                     }
                     
-                    // 确保都在全文索引中（启动时轻量同步）
-                    let _ = tantivy_index.add_document(&doc.id, &doc.name, &doc.content);
-                    
                     docs.push(doc);
                 }
-                tracing::info!("📚 成功从数据库加载并同步 {} 个文档", count);
+                tracing::info!("📚 成功从数据库加载 {} 个文档记录", count);
             }
             Err(e) => {
                 tracing::error!("❌ 无法加载数据库文档: {}", e);
             }
         }
 
-        // 如果需要重建向量
+        // 如果需要重建向量及索引 (Chunk 改造)
         if needs_reembed {
+            let _ = tantivy_index.clear_all();
             for (id, name, content) in docs_to_reembed {
-                let embed_text = format!("【{}】\n{}", name, content);
-                if let Ok(embedding) = embedder.embed(&embed_text) {
-                    let _ = vector_db.insert(&id, &embedding);
-                    tracing::info!("♻️ 已为文档 {} 重新生成维度为 {} 的向量", id, current_dim);
+                let chunks = crate::ai::chunker::chunk_text(&content, 800, 100);
+                for chunk in chunks.iter() {
+                    let chunk_id = format!("{}_{}", id, chunk.index);
+                    let embed_text = format!("【文件: {}】\n{}", name, chunk.content);
+                    if let Ok(embedding) = embedder.embed(&embed_text) {
+                        let _ = vector_db.insert(&chunk_id, &id, chunk.index, &chunk.content, &embedding);
+                    }
+                    let _ = tantivy_index.add_document(&chunk_id, &name, &chunk.content);
                 }
+                tracing::info!("♻️ 已为文档 {} 重新生成 {} 个 Chunks 并入库", id, chunks.len());
             }
         }
 
         Ok(Self {
             vector_db,
             embedder,
+            reranker,
             documents,
             tantivy_index,
         })
@@ -273,11 +306,6 @@ impl KnowledgeBase {
             None
         };
 
-        // 生成向量嵌入（注入文件名元数据，提升按文件名搜索的匹配度）
-        let embed_text = format!("【{}】\n{}", name, final_content);
-        let embedding = self.embedder.embed(&embed_text)?;
-        self.vector_db.insert(&doc_id, &embedding)?;
-
         let doc = Document {
             id: doc_id,
             name,
@@ -289,17 +317,39 @@ impl KnowledgeBase {
             created_at: Utc::now().to_rfc3339(),
         };
 
-        // 同步写入 Tantivy 全文索引
-        if let Err(e) = self.tantivy_index.add_document(&doc.id, &doc.name, &doc.content) {
-            tracing::warn!("Tantivy 索引写入失败（非致命）: {}", e);
-        }
-
         // 保存文档元数据到数据库
         self.vector_db.save_document(
             &doc.id, &doc.name, &doc.category, &doc.content,
             doc.source_path.as_deref(), doc.backup_path.as_deref(),
             &doc.file_type, &doc.created_at,
         )?;
+
+        // 切片并将其存储为 Chunks (使用 spawn_blocking 防止阻塞 Tauri 的异步 Runtime)
+        let vector_db = self.vector_db.clone();
+        let embedder = self.embedder.clone();
+        let tantivy_index = self.tantivy_index.clone();
+        
+        // 我们不需要等待所有异步插入都完成才返回(UI上表示添加任务已收录)，
+        // 也可以选择在这里 await 以便给前端精准的回调，这里选择阻塞当前返回确保一致性。
+        let doc_id_clone = doc.id.clone();
+        let doc_name_clone = doc.name.clone();
+        let doc_content_clone = doc.content.clone();
+        
+        let _ = tokio::task::spawn_blocking(move || {
+            let chunks = crate::ai::chunker::chunk_text(&doc_content_clone, 800, 100);
+            for chunk in chunks {
+                let chunk_id = format!("{}_{}", doc_id_clone, chunk.index);
+                // 生成向量嵌入（注入文件名元数据，提升按文件名搜索的匹配度）
+                let embed_text = format!("【文件: {}】\n{}", doc_name_clone, chunk.content);
+                if let Ok(embedding) = embedder.embed(&embed_text) {
+                    let _ = vector_db.insert(&chunk_id, &doc_id_clone, chunk.index, &chunk.content, &embedding);
+                }
+                // 同步写入 Tantivy 全文索引 (按 Chunk 粒度)
+                if let Err(e) = tantivy_index.add_document(&chunk_id, &doc_name_clone, &chunk.content) {
+                    tracing::warn!("Tantivy 索引写入失败（非致命）: {}", e);
+                }
+            }
+        }).await;
 
         // 保存到内存中
         self.documents.write().push(doc.clone());
@@ -310,25 +360,28 @@ impl KnowledgeBase {
 
     /// 搜索相关知识
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>, KbError> {
-        let query_embedding = self.embedder.embed(query)?;
+        let bge_query = format!("为这个句子生成表示以用于检索相关文章：{}", query);
+        let query_embedding = self.embedder.embed(&bge_query)?;
         tracing::info!("Query embedding length: {}", query_embedding.len());
-        let similar_docs = self.vector_db.search(&query_embedding, limit)?;
+        let similar_chunks = self.vector_db.search(&query_embedding, limit)?;
 
         let documents = self.documents.read();
         let mut results = Vec::new();
 
-        for (doc_id, relevance) in similar_docs {
-            tracing::info!("Doc ID: {}, Relevance: {}", doc_id, relevance);
+        for (doc_id, chunk_index, chunk_content, relevance) in similar_chunks {
+            tracing::info!("Doc ID: {}, Chunk: {}, Relevance: {}", doc_id, chunk_index, relevance);
             if let Some(doc) = documents.iter().find(|d| d.id == doc_id) {
-                let snippet = if doc.content.len() > 300 {
-                    let char_boundary = doc.content.char_indices().nth(300).map(|(i, _)| i).unwrap_or(doc.content.len());
-                    format!("{}...", &doc.content[..char_boundary])
+                let snippet = if chunk_content.len() > 300 {
+                    let char_boundary = chunk_content.char_indices().nth(300).map(|(i, _)| i).unwrap_or(chunk_content.len());
+                    format!("{}...", &chunk_content[..char_boundary])
                 } else {
-                    doc.content.clone()
+                    chunk_content.clone()
                 };
 
                 results.push(SearchResult {
                     document: doc.clone(),
+                    chunk_index,
+                    chunk_content: chunk_content.clone(),
                     relevance,
                     snippet,
                 });
@@ -336,6 +389,86 @@ impl KnowledgeBase {
         }
 
         Ok(results)
+    }
+
+    /// 混合检索 (Hybrid Search)
+    /// 结合全文搜索(Tantivy)与向量搜索(ONNX)，并使用 RRF 算法进行结果重排融合。
+    pub async fn search_hybrid(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>, KbError> {
+        let (vec_res, ft_res) = tokio::join!(
+            self.search(query, limit * 2), // 取两倍候选集确保 RRF 有足够样本
+            self.search_fulltext(query, limit * 2)
+        );
+
+        let vec_results = vec_res.unwrap_or_else(|e| {
+            tracing::warn!("混合检索 - 向量检索失败: {}", e);
+            vec![]
+        });
+        
+        let ft_results = ft_res.unwrap_or_else(|e| {
+            tracing::warn!("混合检索 - 全文检索失败: {}", e);
+            vec![]
+        });
+
+        // 如果有一方完全失败，退化为相对成功的单路
+        if vec_results.is_empty() { return Ok(ft_results.into_iter().take(limit).collect()); }
+        if ft_results.is_empty() { return Ok(vec_results.into_iter().take(limit).collect()); }
+
+        // RRF (Reciprocal Rank Fusion)
+        use std::collections::HashMap;
+        let mut rrf_scores: HashMap<String, f32> = HashMap::new(); // chunk_id -> rrf_score
+        let mut result_map: HashMap<String, SearchResult> = HashMap::new();
+        let rrf_k = 60.0;
+
+        for (rank, res) in vec_results.into_iter().enumerate() {
+            let chunk_id = format!("{}_{}", res.document.id, res.chunk_index);
+            let score = 1.0 / (rrf_k + (rank as f32 + 1.0));
+            *rrf_scores.entry(chunk_id.clone()).or_insert(0.0) += score;
+            result_map.insert(chunk_id, res);
+        }
+
+        for (rank, res) in ft_results.into_iter().enumerate() {
+            let chunk_id = format!("{}_{}", res.document.id, res.chunk_index);
+            let score = 1.0 / (rrf_k + (rank as f32 + 1.0));
+            *rrf_scores.entry(chunk_id.clone()).or_insert(0.0) += score;
+            result_map.insert(chunk_id, res);
+        }
+
+        // 按 RRF 分数倒序排序
+        let mut fused_results: Vec<(String, f32)> = rrf_scores.into_iter().collect();
+        fused_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let limit_rerank = if self.reranker.is_some() { limit * 2 } else { limit }; // 有重排序的话，粗排留多点
+        let mut final_results = Vec::new();
+        for (chunk_id, score) in fused_results.into_iter().take(limit_rerank) {
+            if let Some(mut sr) = result_map.remove(&chunk_id) {
+                sr.relevance = score; // 暂存 RRF 分数
+                final_results.push(sr);
+            }
+        }
+
+        // 第二阶段：交叉精排 (Cross-Encoder Reranking)
+        if let Some(reranker_mutex) = &self.reranker {
+            let chunks_text_owned: Vec<String> = final_results.iter()
+                .map(|r| format!("【文件: {}】\n{}", r.document.name, r.chunk_content))
+                .collect();
+            let chunks_text: Vec<&str> = chunks_text_owned.iter().map(|s| s.as_str()).collect();
+            
+            let mut rr = reranker_mutex.lock();
+            if let Ok(rerank_scores) = rr.rerank(query, &chunks_text) {
+                // 替换分数为精排绝对相似度
+                for (i, sr) in final_results.iter_mut().enumerate() {
+                    sr.relevance = rerank_scores[i];
+                }
+                // 根据精排绝对相似度重新排序
+                final_results.sort_by(|a, b| b.relevance.partial_cmp(&a.relevance).unwrap_or(std::cmp::Ordering::Equal));
+                // 既然分数的绝对意义恢复了（0-1），我们在这里或者外部就可以安全使用诸如 0.35 之类的高门槛抛弃无意义文本
+            } else {
+                tracing::warn!("Reranker 重排序推断失败，回退到 RRF 分数");
+            }
+        }
+
+        final_results.truncate(limit); // 最终只返回截断后的 K 个结果
+        Ok(final_results)
     }
 
     /// 删除文档
@@ -382,9 +515,17 @@ impl KnowledgeBase {
         let mut results = Vec::new();
 
         for ft in ft_results {
-            if let Some(doc) = documents.iter().find(|d| d.id == ft.doc_id) {
+            // 解析 chunk_id "UUID_ChunkIndex"
+            let parts: Vec<&str> = ft.doc_id.split('_').collect();
+            if parts.is_empty() { continue; }
+            let real_doc_id = parts[0];
+            let chunk_idx = parts.get(1).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+
+            if let Some(doc) = documents.iter().find(|d| d.id == real_doc_id) {
                 results.push(SearchResult {
                     document: doc.clone(),
+                    chunk_index: chunk_idx,
+                    chunk_content: ft.content.clone(),
                     relevance: ft.score,
                     snippet: ft.snippet,
                 });

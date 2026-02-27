@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 use tauri::{AppHandle, Manager};
-use tracing::{error, info};
+use tracing::{error, info, warn};
+use futures_util::StreamExt;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct VideoInfo {
@@ -164,32 +165,70 @@ async fn call_asr_service(audio_path: &Path) -> Result<String, String> {
 
     info!("[Video] ASR 服务响应状态: {}", response.status());
 
+    // 检查是否为 SSE 流
+    let is_sse = response.headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.contains("text/event-stream"))
+        .unwrap_or(false);
 
-    // 流式读取 SSE 响应
-    let body = response
-        .text()
-        .await
-        .map_err(|e| format!("读取 ASR 响应失败: {}", e))?;
+    if !is_sse {
+        warn!("[Video] ASR 服务未返回 event-stream，尝试读取全文内容");
+        // 如果不是 SSE，回退到普通文本读取
+        let text = response.text().await.map_err(|e| format!("读取非流式响应失败: {}", e))?;
+        return Ok(text);
+    }
 
+    // 以字节流方式逐块读取 SSE 响应
+    let mut stream = response.bytes_stream();
+    let mut buffer = String::new();
     let mut final_text = String::new();
     let mut success = false;
+    let mut done = false;
+    let mut processed_chunks = 0;
 
-    for line in body.lines() {
-        if line.starts_with("data: ") {
-            let json_str = &line[6..];
-            if json_str.trim() == "[DONE]" {
-                break;
+    while let Some(chunk_result) = stream.next().await {
+        if done { break; }
+        
+        let chunk = match chunk_result {
+            Ok(c) => c,
+            Err(e) => {
+                error!("[Video] 读取 ASR 数据块失败 (已处理 {} 个块): {}", processed_chunks, e);
+                return Err(format!("网络读取中断: {}。如果此问题持续出现，请尝试重启应用以释放占用的进程或资源。", e));
+            }
+        };
+        processed_chunks += 1;
+        let chunk_str = String::from_utf8_lossy(&chunk);
+        buffer.push_str(&chunk_str);
+
+        // 按行解析
+        while let Some(pos) = buffer.find('\n') {
+            let line = buffer[..pos].trim().to_string();
+            buffer = buffer[pos + 1..].to_string();
+
+            if line.is_empty() {
+                continue;
             }
 
-            if let Ok(data) = serde_json::from_str::<serde_json::Value>(json_str) {
-                if let Some(status) = data["status"].as_str() {
-                    if status == "error" {
-                        let msg = data["error"].as_str().unwrap_or("未知错误");
-                        return Err(format!("ASR 转写失败: {}", msg));
-                    }
-                    if status == "success" {
-                        final_text = data["text"].as_str().unwrap_or("").to_string();
-                        success = true;
+            if line.starts_with("data: ") {
+                let json_str = &line[6..];
+                if json_str.trim() == "[DONE]" {
+                    done = true;
+                    break;
+                }
+
+                if let Ok(data) = serde_json::from_str::<serde_json::Value>(json_str) {
+                    if let Some(status) = data["status"].as_str() {
+                        if status == "error" {
+                            let msg = data["error"].as_str().unwrap_or("未知错误");
+                            return Err(format!("ASR 转写失败: {}", msg));
+                        }
+                        if status == "success" {
+                            final_text = data["text"].as_str().unwrap_or("").to_string();
+                            success = true;
+                            done = true; // 拿到结果，可以提前退出了
+                            break;
+                        }
                     }
                 }
             }
@@ -197,7 +236,7 @@ async fn call_asr_service(audio_path: &Path) -> Result<String, String> {
     }
 
     if !success {
-        return Err("ASR 服务未返回结果，请检查模型是否已下载".to_string());
+        return Err("ASR 服务未返回成功标志，请检查 GPU 是否可用。".to_string());
     }
 
     Ok(final_text)

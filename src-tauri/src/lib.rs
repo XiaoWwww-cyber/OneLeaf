@@ -81,6 +81,7 @@ pub fn run() {
                         core::tray::open_settings_window(&app_handle);
                     }
                     "quit" => {
+                        core::sidecar_manager::kill_sidecar(&app_handle);
                         std::process::exit(0);
                     }
                     _ => {}
@@ -111,6 +112,7 @@ pub fn run() {
             commands::ai::delete_conversation_record,
             commands::ai::save_message,
             commands::ai::load_messages,
+            commands::ai::save_text_as_temp_file,
             commands::asr::check_asr_model,
             commands::asr::download_asr_model,
             commands::video::upload_video,
@@ -119,6 +121,17 @@ pub fn run() {
             commands::logs::clear_logs,
             open_settings
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            match event {
+                tauri::RunEvent::Exit => {
+                    core::sidecar_manager::kill_sidecar(app_handle);
+                }
+                tauri::RunEvent::ExitRequested { .. } => {
+                    core::sidecar_manager::kill_sidecar(app_handle);
+                }
+                _ => {}
+            }
+        });
 }

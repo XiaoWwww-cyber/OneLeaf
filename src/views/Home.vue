@@ -8,7 +8,7 @@ import { marked } from 'marked'
 import {
   ChatDotRound, Document, VideoPlay,
   Fold, Expand, Delete, Search, ArrowDown, EditPen,
-  Paperclip, Lightning, Phone, CopyDocument, More, Top, Setting
+  Paperclip, Lightning, Phone, CopyDocument, More, Top, Setting, Loading
 } from '@element-plus/icons-vue'
 import VideoTranscriptDialog from '../components/VideoTranscriptDialog.vue'
 
@@ -54,6 +54,7 @@ const isCurrentLoading = computed(() => {
 
 // 用于中断流式生成
 let stopStreamFlag = false
+const isTranscribing = ref(false)
 
 const handleStopGenerate = () => {
   stopStreamFlag = true
@@ -144,16 +145,31 @@ const handleChatUploadVideo = async () => {
   const fileName = filePath.split(/[\\/]/).pop() || filePath
 
   try {
-    ElMessage.info(`正在上传 ${fileName}...`)
-    const fileId = await invoke<string>('upload_file_to_ai', { filePath })
+    isTranscribing.value = true
+    ElMessage.info(`正在分析视频并转写文本: ${fileName}...`)
+    // 调用视频转写逻辑
+    const res = await invoke<{ text: string }>('transcribe_video', { videoPath: filePath })
+    if (!res.text) {
+      throw new Error("转写结果为空")
+    }
+
+    // 将转写文本保存为临时文件，以便作为 LOCAL_FILE 处理
+    const tempFileName = `${fileName}_transcript_${Date.now()}.txt`
+    const fileId = await invoke<string>('save_text_as_temp_file', {
+      content: res.text,
+      fileName: tempFileName
+    })
+
     attachedFiles.value.push({
       fileId,
-      fileType: 'video',
-      fileName,
+      fileType: 'file', // 转写后作为文本文件发送
+      fileName: `[视频转写] ${fileName}`,
     })
-    ElMessage.success(`${fileName} 已添加`)
+    ElMessage.success(`${fileName} 转写并添加成功`)
   } catch (e) {
-    ElMessage.error(`上传失败: ${e}`)
+    ElMessage.error(`分析失败: ${e}`)
+  } finally {
+    isTranscribing.value = false
   }
 }
 
@@ -442,16 +458,27 @@ const handleSend = async () => {
     }
 
     if (chunk.chunk_type === 'text') {
-      streamFullText += chunk.delta
+      const delta = chunk.delta
+      streamFullText += delta
+
+      // 兼容本地模型：如果 delta 包含 </think>，通常意味着思考结束
+      if (delta.includes('</think>') || streamFullText.includes('</think>')) {
+        if (!msgProxy.thinkingDone) {
+          msgProxy.thinkingDone = true
+        }
+      }
+
       msgProxy.answer = streamFullText
       msgProxy.content = (streamThinking ? `<think>${streamThinking}</think>\n\n` : '') + streamFullText
-      // 收到第一个正文 chunk 时，折叠思考面板
-      if (!msgProxy.thinkingDone && streamThinking) {
+
+      // 兼容云端模型：收到第一个正文 chunk 时（如果非思考内容），折叠思考面板
+      if (!msgProxy.thinkingDone && streamThinking && !delta.includes('<think>')) {
         msgProxy.thinkingDone = true
       }
     } else if (chunk.chunk_type === 'thinking') {
       streamThinking += chunk.delta
       msgProxy.thinking = streamThinking
+      msgProxy.thinkingDone = false // 确保在思考中
     }
 
     triggerRef(messages)
@@ -486,6 +513,7 @@ const handleSend = async () => {
       streamMsg.content = parsed.content
       streamMsg.thinking = parsed.thinking
       streamMsg.answer = parsed.answer
+      streamMsg.thinkingDone = parsed.thinkingDone // 核心修复：同步思考状态
       if (activeConversationId.value === currentSessionId) {
         messages.value.push(streamMsg)
       }
@@ -824,11 +852,15 @@ const openSettings = async () => {
 
           <div class="input-tools-row">
             <div class="input-tools-left">
-              <div class="action-btn" @click="handleChatUploadVideo">
-                <el-icon>
+              <div class="action-btn" @click="handleChatUploadVideo" :class="{ loading: isTranscribing }"
+                :disabled="isTranscribing">
+                <el-icon v-if="isTranscribing" class="is-loading">
+                  <Loading />
+                </el-icon>
+                <el-icon v-else>
                   <Lightning />
                 </el-icon>
-                <span>视频转写</span>
+                <span>{{ isTranscribing ? '转写中...' : '视频转写' }}</span>
               </div>
 
               <div class="action-btn" @click="handleChatUploadFile">
@@ -909,7 +941,9 @@ const openSettings = async () => {
             <div class="sr-title">
               <span class="kb-emoji-icon">{{ getDocIcon(result.document) }}</span>
               <span class="sr-name">{{ result.document.name }}</span>
-              <span class="sr-score">{{ (result.relevance * 100).toFixed(0) }}%</span>
+              <span class="sr-score" :title="'Score: ' + result.relevance">{{ result.relevance >= 0.1 ?
+                (result.relevance *
+                  100).toFixed(0) + '%' : result.relevance.toFixed(3) }}</span>
             </div>
             <div class="sr-snippet">{{ result.snippet }}</div>
           </div>
@@ -1529,6 +1563,16 @@ const openSettings = async () => {
 .action-btn:hover {
   background: rgba(255, 255, 255, 0.08);
   color: #e3e3e3;
+}
+
+.action-btn.loading {
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+
+.action-btn.loading:hover {
+  background: rgba(255, 255, 255, 0.02);
+  color: #888;
 }
 
 .send-btn {

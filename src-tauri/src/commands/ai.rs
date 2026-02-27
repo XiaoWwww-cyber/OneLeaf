@@ -54,8 +54,8 @@ pub async fn init_knowledge_base(app: AppHandle, db_path: String) -> Result<(), 
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
 
-    // 假设模型目录在 app_data/models/bge-small-zh
-    let model_dir = app.path().app_data_dir().unwrap().join("models").join("bge-small-zh");
+    // 假设模型目录在 app_data/models/bge-base-zh
+    let model_dir = app.path().app_data_dir().unwrap().join("models").join("bge-base-zh");
     let model_file = model_dir.join("model.onnx");
     let model_path = if model_file.exists() {
         info!("找到向量模型文件: {:?}", model_file);
@@ -131,6 +131,23 @@ pub async fn upload_file_to_ai(file_path: String) -> Result<String, String> {
         .map_err(|e| format!("文件上传失败: {}", e))
 }
 
+/// 将纯文本保存为临时文件并返回 LOCAL_FILE:<path>（用于转写附件）
+#[tauri::command]
+pub async fn save_text_as_temp_file(
+    app: AppHandle,
+    content: String,
+    file_name: String,
+) -> Result<String, String> {
+    info!("正在将转写内容保存为临时文件: {}", file_name);
+    let temp_dir = crate::utils::paths::get_temp_dir(&app);
+    std::fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
+    
+    let dest_path = temp_dir.join(&file_name);
+    std::fs::write(&dest_path, content).map_err(|e| e.to_string())?;
+    
+    Ok(format!("LOCAL_FILE:{}", dest_path.to_string_lossy()))
+}
+
 /// AI 对话（RAG 模式 + 流式响应）
 /// 1. 搜索知识库获取上下文
 /// 2. 注入系统提示词
@@ -185,41 +202,83 @@ pub async fn chat_with_ai(
             info!("执行 RAG 搜索 (当前知识库共 {} 个文档)，查询: {}", doc_count, query);
             
             let (results, search_type) = if kb.has_semantic_embedder() {
-                (kb.search(query, 3).await.ok(), "向量语义搜索")
+                // 有 AI 模型时直接调用强大的双路混合检索 (语义 + 全文 RRF)
+                (kb.search_hybrid(query, 10).await.ok(), "混合检索 (语义 + 全文 RRF)")
             } else {
-                (kb.search_fulltext(query, 3).await.ok(), "全文搜索")
+                (kb.search_fulltext(query, 10).await.ok(), "全文检索 (降级)")
             };
 
             info!("使用 {} 模式进行检索", search_type);
 
-            if let Some(results) = results {
-                // 相似度阈值过滤：低于 0.6 的结果直接丢弃，避免"矮子里拔将军"
-                let threshold = 0.50_f32;
-                let filtered: Vec<_> = results
-                    .into_iter()
-                    .filter(|r| {
+            if let Some(mut results) = results {
+                // 相似度阈值过滤：根据检索模式动态调整
+                results.retain(|r| {
+                    if search_type.contains("RRF") {
+                        if kb.has_reranker() {
+                            // Stage 2 交叉精排出的绝对相似度具有明确物理意义
+                            let threshold = 0.40_f32;
+                            if r.relevance < threshold {
+                                info!("过滤低相关度文档: {} (精排分数: {} < {})", r.document.name, r.relevance, threshold);
+                                false
+                            } else {
+                                true
+                            }
+                        } else {
+                            // 纯 RRF 算法出的分数非常小（例如 0.01 左右），不需要用高阈值过滤
+                            if r.relevance < 0.005 {
+                                info!("过滤低相关度文档: {} (RRF 分数: {} < 0.005)", r.document.name, r.relevance);
+                                false
+                            } else {
+                                true
+                            }
+                        }
+                    } else {
+                        // 普通全文/截断阈值保留
+                        let threshold = 0.15_f32;
                         if r.relevance < threshold {
                             info!("过滤低相关度文档: {} (相关度: {} < {})", r.document.name, r.relevance, threshold);
                             false
                         } else {
                             true
                         }
-                    })
-                    .collect();
+                    }
+                });
 
-                info!("RAG 搜索完成，阈值过滤后有效结果: {} 条", filtered.len());
-                if !filtered.is_empty() {
-                    let ctx = filtered
-                        .iter()
-                        .map(|r| {
-                            info!("有效匹配: {} (相关度: {})", r.document.name, r.relevance);
-                            format!("【{}】{}", r.document.name, r.document.content)
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n\n");
-                    Some((ctx, filtered))
+                info!("RAG 初筛完成，有效结果: {} 条", results.len());
+                if !results.is_empty() {
+                    // Top-K 与长度截断防线
+                    let max_context_len = 8000;
+                    let mut current_len = 0;
+                    let mut final_ctx_blocks = Vec::new();
+                    let mut final_results = Vec::new();
+
+                    for (i, r) in results.into_iter().enumerate() {
+                        let block = format!("【参考片段 {}】(来源文件: {} | 分类: {} | 录入时间: {})\n内容: {}\n", 
+                            i + 1, r.document.name, r.document.category, r.document.created_at, r.chunk_content);
+                        let block_len = block.chars().count();
+                        
+                        // 为了保证上下文完整性，如果加入当前块后导致严重超载，则放弃这条
+                        if current_len + block_len > max_context_len && !final_ctx_blocks.is_empty() {
+                            info!("达到上下文长度上限 ({} chars)，忽略剩余检索结果", current_len);
+                            break;
+                        }
+                        
+                        current_len += block_len;
+                        final_ctx_blocks.push(block);
+                        final_results.push(r.clone());
+                        info!("加入上下文: [{}] Chunk {} (相关度: {}, 累计长度: {})", r.document.name, r.chunk_index, r.relevance, current_len);
+                        
+                        // 强制截断数量 (例如不超过 10 条片段)
+                        if final_results.len() >= 10 {
+                            info!("达到最大截断片段数 (10 个)");
+                            break;
+                        }
+                    }
+
+                    let ctx = final_ctx_blocks.join("\n\n");
+                    Some((ctx, final_results))
                 } else {
-                    info!("所有结果相关度均低于阈值 {}，退化为普通对话模式", threshold);
+                    info!("所有结果相关度均低于相应检索模式的要求，退化为普通对话模式");
                     None
                 }
             } else {
@@ -743,15 +802,15 @@ fn get_embedding_models_dir(app: &AppHandle) -> PathBuf {
 #[tauri::command]
 pub async fn get_embedding_model_status(app: AppHandle) -> Result<EmbeddingModelInfo, String> {
     let models_dir = get_embedding_models_dir(&app);
-    let model_dir = models_dir.join("bge-small-zh");
+    let model_dir = models_dir.join("bge-base-zh");
 
     // rust_tokenizers 依赖 vocab.txt
     let is_installed = model_dir.join("model.onnx").exists() && model_dir.join("vocab.txt").exists();
 
     Ok(EmbeddingModelInfo {
-        name: "BGE-small-zh-v1.5".to_string(),
+        name: "BGE-base-zh-v1.5".to_string(),
         description: "智源中文语义嵌入模型 (用于知识库 RAG 向量搜索)".to_string(),
-        size_mb: 95,
+        size_mb: 326,
         is_installed,
         model_dir: model_dir.to_string_lossy().to_string(),
     })
@@ -762,11 +821,11 @@ pub async fn download_embedding_model(app: AppHandle) -> Result<(), String> {
     use tauri::Emitter; // 引入 Emitter 用于触发事件
     
     let models_dir = get_embedding_models_dir(&app);
-    let model_dir = models_dir.join("bge-small-zh");
+    let model_dir = models_dir.join("bge-base-zh");
     std::fs::create_dir_all(&model_dir).map_err(|e| format!("创建目录失败: {}", e))?;
 
-    let base_url = "https://hf-mirror.com/Xenova/bge-small-zh-v1.5/resolve/main/onnx";
-    let root_url = "https://hf-mirror.com/Xenova/bge-small-zh-v1.5/resolve/main";
+    let base_url = "https://hf-mirror.com/Xenova/bge-base-zh-v1.5/resolve/main/onnx";
+    let root_url = "https://hf-mirror.com/Xenova/bge-base-zh-v1.5/resolve/main";
 
     let files = vec![
         ("model.onnx", format!("{}/model.onnx", base_url)),

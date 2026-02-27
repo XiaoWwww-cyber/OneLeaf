@@ -25,10 +25,33 @@ impl VectorDb {
         let conn = Connection::open(db_path)
             .map_err(|e| VectorDbError::ConnectionFailed(e.to_string()))?;
 
+        // 升级判断：如果 document_vectors 旧表不存在 chunk_index 字段，直接 DROP 重建
+        let has_chunk_index = {
+            let mut stmt = conn.prepare("PRAGMA table_info(document_vectors)")?;
+            let mut found = false;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let name: String = row.get(1)?;
+                if name == "chunk_index" {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+
+        if !has_chunk_index {
+            tracing::warn!("升级 document_vectors 表结构 (丢弃旧版本单文件向量数据)...");
+            conn.execute("DROP TABLE IF EXISTS document_vectors", [])?;
+        }
+
         // 创建向量表
         conn.execute(
             "CREATE TABLE IF NOT EXISTS document_vectors (
-                document_id TEXT PRIMARY KEY,
+                id TEXT PRIMARY KEY,
+                document_id TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                chunk_content TEXT NOT NULL,
                 embedding BLOB NOT NULL,
                 dimension INTEGER NOT NULL,
                 created_at TEXT NOT NULL
@@ -256,17 +279,17 @@ impl VectorDb {
         }
     }
 
-    /// 插入向量
-    pub fn insert(&self, document_id: &str, embedding: &[f32]) -> Result<(), VectorDbError> {
+    /// 插入 Chunk 向量
+    pub fn insert(&self, id: &str, document_id: &str, chunk_index: usize, chunk_content: &str, embedding: &[f32]) -> Result<(), VectorDbError> {
         let embedding_bytes = self.f32_slice_to_bytes(embedding);
         let dimension = embedding.len() as i32;
         let created_at = chrono::Utc::now().to_rfc3339();
 
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR REPLACE INTO document_vectors (document_id, embedding, dimension, created_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![document_id, embedding_bytes, dimension, created_at],
+            "INSERT OR REPLACE INTO document_vectors (id, document_id, chunk_index, chunk_content, embedding, dimension, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id, document_id, chunk_index, chunk_content, embedding_bytes, dimension, created_at],
         ).map_err(|e| VectorDbError::InsertFailed(e.to_string()))?;
 
         Ok(())
@@ -288,41 +311,41 @@ impl VectorDb {
         Ok(())
     }
 
-    /// 搜索相似向量（使用余弦相似度）
+    /// 搜索相似向量（使用余弦相似度）返回: (document_id, chunk_index, chunk_content, similarity)
     pub fn search(
         &self,
         query_embedding: &[f32],
         limit: usize,
-    ) -> Result<Vec<(String, f32)>, VectorDbError> {
+    ) -> Result<Vec<(String, usize, String, f32)>, VectorDbError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT document_id, embedding, dimension FROM document_vectors")
+            .prepare("SELECT document_id, chunk_index, chunk_content, embedding, dimension FROM document_vectors")
             .map_err(|e| VectorDbError::SearchFailed(e.to_string()))?;
 
         let rows = stmt
             .query_map([], |row| {
                 let document_id: String = row.get(0)?;
-                let embedding_bytes: Vec<u8> = row.get(1)?;
-                let dimension: i32 = row.get(2)?;
-                Ok((document_id, embedding_bytes, dimension))
+                let chunk_index: i32 = row.get(1)?;
+                let chunk_content: String = row.get(2)?;
+                let embedding_bytes: Vec<u8> = row.get(3)?;
+                let dimension: i32 = row.get(4)?;
+                Ok((document_id, chunk_index, chunk_content, embedding_bytes, dimension))
             })
             .map_err(|e| VectorDbError::SearchFailed(e.to_string()))?;
 
         let mut results = Vec::new();
 
         for row in rows {
-            let (document_id, embedding_bytes, dimension) =
+            let (document_id, chunk_index, chunk_content, embedding_bytes, dimension) =
                 row.map_err(|e| VectorDbError::SearchFailed(e.to_string()))?;
 
             let embedding = self.bytes_to_f32_slice(&embedding_bytes, dimension as usize);
             let similarity = self.cosine_similarity(query_embedding, &embedding);
             
-            tracing::info!("vector db doc dimension: {}, query dimension: {}", embedding.len(), query_embedding.len());
-
-            results.push((document_id, similarity));
+            results.push((document_id, chunk_index as usize, chunk_content, similarity));
         }
 
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
         Ok(results.into_iter().take(limit).collect())
     }
 

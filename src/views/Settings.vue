@@ -128,7 +128,7 @@ onMounted(async () => {
         embeddingDownloading.value = false
         embeddingProgress.value = 100
         ElMessage.success('向量知识库模型下载完成！')
-        sendNotification('OneLeaf', '向量检索模型(BGE-small-zh)下载完成！')
+        sendNotification('OneLeaf', '向量检索模型(BGE-base-zh)下载完成！')
       }
     }
     if (d.status === 'failed') {
@@ -412,7 +412,7 @@ const openDirectory = async (path: string | undefined) => {
           <div class="card-icon embedding">🧠</div>
           <div>
             <h2>向量检索模型</h2>
-            <p>BGE-small-zh — 用于知识库语义搜索，提升问答匹配准确率</p>
+            <p>BGE-base-zh — 用于知识库语义搜索，提升问答匹配准确率</p>
           </div>
         </div>
 
