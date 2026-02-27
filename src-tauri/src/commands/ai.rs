@@ -810,7 +810,10 @@ pub async fn download_embedding_model(app: AppHandle) -> Result<(), String> {
             return Err(format!("下载 {} 失败: HTTP {}", file_name, response.status()));
         }
 
-        let total_size = response.content_length().unwrap_or(0);
+        let content_length = response.content_length().unwrap_or(0);
+        // 当服务器不返回 Content-Length 时，使用预估大小
+        let estimated: u64 = if file_name == "model.onnx" { 90 * 1024 * 1024 } else { 300 * 1024 };
+        let total_size = if content_length > 0 { content_length } else { estimated };
         let mut downloaded: u64 = 0;
 
         let mut file = tokio::fs::File::create(&dest_path).await.map_err(|e| format!("创建文件失败: {}", e))?;
@@ -819,15 +822,18 @@ pub async fn download_embedding_model(app: AppHandle) -> Result<(), String> {
         use tokio::io::AsyncWriteExt;
 
         let mut stream = response.bytes_stream();
+        let mut last_emit: u64 = 0;
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| format!("下载错误: {}", e))?;
             file.write_all(&chunk).await.map_err(|e| format!("写入失败: {}", e))?;
 
             downloaded += chunk.len() as u64;
-            let progress = if total_size > 0 { downloaded as f32 / total_size as f32 } else { 0.0 };
+            let progress = (downloaded as f32 / total_size as f32).min(0.99);
 
-            if downloaded % (100 * 1024) < chunk.len() as u64 || downloaded == total_size {
+            // 每 500KB 或首个 chunk 时通知前端
+            if downloaded - last_emit >= 512 * 1024 || last_emit == 0 {
+                last_emit = downloaded;
                 let _ = app.emit("embedding-model-progress", EmbeddingModelProgress {
                     file_name: file_name.to_string(),
                     downloaded_bytes: downloaded,

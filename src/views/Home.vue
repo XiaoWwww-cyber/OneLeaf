@@ -8,7 +8,7 @@ import { marked } from 'marked'
 import {
   ChatDotRound, Document, VideoPlay,
   Fold, Expand, Delete, Search, ArrowDown, EditPen,
-  Paperclip, Lightning, Phone, CopyDocument, More, Top
+  Paperclip, Lightning, Phone, CopyDocument, More, Top, Setting
 } from '@element-plus/icons-vue'
 import VideoTranscriptDialog from '../components/VideoTranscriptDialog.vue'
 
@@ -611,7 +611,7 @@ const refreshDocuments = async () => {
 const handleUploadFile = async () => {
   const selected = await open({
     multiple: false,
-    filters: [{ name: '文档', extensions: ['txt', 'md', 'docx', 'pdf'] }]
+    filters: [{ name: '文档', extensions: ['txt', 'doc', 'docx'] }]
   })
   if (!selected || Array.isArray(selected)) return
   const filePath = selected
@@ -647,6 +647,34 @@ const handleDeleteDoc = async (id: string) => {
     ElMessage.error(`删除失败: ${e}`)
   }
 }
+
+const openSettings = async () => {
+  try {
+    // 使用 Tauri JS API 直接创建窗口，绕过 Rust 端 run_on_main_thread 死锁
+    const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow')
+    const existing = await WebviewWindow.getByLabel('settings')
+    if (existing) {
+      await existing.show()
+      await existing.setFocus()
+      return
+    }
+    const webview = new WebviewWindow('settings', {
+      url: '/#/settings',
+      title: 'OneLeaf 设置',
+      width: 700,
+      height: 600,
+      minWidth: 500,
+      minHeight: 400,
+      resizable: true,
+      center: true,
+    })
+    webview.once('tauri://error', (e) => {
+      console.error('设置窗口创建失败:', e)
+    })
+  } catch (e) {
+    console.error('打开设置失败', e)
+  }
+}
 </script>
 
 <template>
@@ -675,6 +703,15 @@ const handleDeleteDoc = async (id: string) => {
           <div v-if="conversations.length === 0" class="empty-hint">
             暂无对话记录
           </div>
+        </div>
+      </div>
+
+      <div class="sidebar-footer">
+        <div class="settings-btn" @click="openSettings" title="设置">
+          <el-icon>
+            <Setting />
+          </el-icon>
+          <span>设置</span>
         </div>
       </div>
     </aside>
@@ -1051,6 +1088,34 @@ const handleDeleteDoc = async (id: string) => {
   flex: 1;
   overflow-y: auto;
   padding: 12px 8px;
+}
+
+.sidebar-footer {
+  padding: 8px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  flex-shrink: 0;
+}
+
+.settings-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  cursor: pointer;
+  color: #888;
+  font-size: 0.88rem;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+
+.settings-btn:hover {
+  background: rgba(255, 255, 255, 0.06);
+  color: #e3e3e3;
+}
+
+.settings-btn .el-icon {
+  font-size: 1.1rem;
 }
 
 /* ========== 固定聊天头部 ========== */

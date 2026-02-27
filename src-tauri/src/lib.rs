@@ -11,11 +11,25 @@ fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
 }
 
+#[tauri::command]
+fn open_settings(app: tauri::AppHandle) {
+    core::tray::open_settings_window(&app);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            let _ = app.get_webview_window("main")
+                .and_then(|w| {
+                    let _ = w.show();
+                    let _ = w.unminimize();
+                    let _ = w.set_focus();
+                    Some(())
+                });
+        }))
         .setup(|app| {
             // 初始化日志系统（终端 + 按天滚动文件）
             let log_dir = app.path()
@@ -102,7 +116,8 @@ pub fn run() {
             commands::video::upload_video,
             commands::video::transcribe_video,
             commands::logs::get_log_info,
-            commands::logs::clear_logs
+            commands::logs::clear_logs,
+            open_settings
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

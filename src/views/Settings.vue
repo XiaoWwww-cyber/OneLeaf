@@ -7,6 +7,20 @@ import { openPath } from '@tauri-apps/plugin-opener'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Download, Loading, Delete } from '@element-plus/icons-vue'
 
+/** 发送系统通知（浏览器 Notification API） */
+const sendNotification = (title: string, body: string) => {
+  if (!('Notification' in window)) return
+  if (Notification.permission === 'granted') {
+    new Notification(title, { body })
+  } else if (Notification.permission !== 'denied') {
+    Notification.requestPermission().then(perm => {
+      if (perm === 'granted') {
+        new Notification(title, { body })
+      }
+    })
+  }
+}
+
 // ========== ASR 模型状态 ==========
 interface AsrModelStatus {
   name: string
@@ -64,8 +78,8 @@ const lmStudioChecking = ref(false)
 const providerOptions = [
   { label: 'LM Studio (本地)', value: 'lmstudio' },
   { label: '豆包', value: 'doubao' },
-  { label: 'OpenAI', value: 'openai' },
-  { label: 'DeepSeek', value: 'deepseek' },
+  // { label: 'OpenAI', value: 'openai' },
+  // { label: 'DeepSeek', value: 'deepseek' },
 ]
 
 // ========== 初始化 ==========
@@ -81,12 +95,16 @@ onMounted(async () => {
     asrProgress.value = Math.round(d.progress * 100)
     if (d.total_bytes > 0) {
       asrProgressBytes.value = `${formatBytes(d.downloaded_bytes)} / ${formatBytes(d.total_bytes)}`
+    } else {
+      asrProgressBytes.value = `${formatBytes(d.downloaded_bytes)}`
     }
     if (d.status === 'completed' && (d.file_name === 'tokens.txt' || d.file_name === 'model.onnx')) {
       checkAsrModel()
       if (d.file_name === 'tokens.txt') {
         asrDownloading.value = false
+        asrProgress.value = 100
         ElMessage.success('ASR 模型下载完成！')
+        sendNotification('OneLeaf', '语音识别模型(SenseVoice)下载完成！')
       }
     }
     if (d.status === 'failed') {
@@ -101,12 +119,16 @@ onMounted(async () => {
     embeddingProgress.value = Math.round(d.progress * 100)
     if (d.total_bytes > 0) {
       embeddingProgressBytes.value = `${formatBytes(d.downloaded_bytes)} / ${formatBytes(d.total_bytes)}`
+    } else {
+      embeddingProgressBytes.value = `${formatBytes(d.downloaded_bytes)}`
     }
     if (d.status === 'completed' && (d.file_name === 'vocab.txt' || d.file_name === 'model.onnx')) {
       checkEmbeddingModel()
       if (d.file_name === 'vocab.txt') {
         embeddingDownloading.value = false
+        embeddingProgress.value = 100
         ElMessage.success('向量知识库模型下载完成！')
+        sendNotification('OneLeaf', '向量检索模型(BGE-small-zh)下载完成！')
       }
     }
     if (d.status === 'failed') {
@@ -440,7 +462,7 @@ const openDirectory = async (path: string | undefined) => {
               </span>
             </template>
           </div>
-          <div c？lass="footer-right">
+          <div class="footer-right">
             <template v-if="!embeddingStatus?.is_installed">
               <el-button type="primary" :loading="embeddingDownloading" @click="handleDownloadEmbedding">
                 <el-icon v-if="!embeddingDownloading">

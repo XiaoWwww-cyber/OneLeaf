@@ -68,7 +68,7 @@ pub fn show_main_window(app: &AppHandle) {
     }
 }
 
-/// 打开设置窗口
+/// 打开设置窗口（仅供托盘菜单调用，已在主线程）
 pub fn open_settings_window(app: &AppHandle) {
     // 如果已存在则激活
     if let Some(window) = app.get_webview_window("settings") {
@@ -77,16 +77,31 @@ pub fn open_settings_window(app: &AppHandle) {
         return;
     }
 
-    // 创建新窗口
-    let _window = WebviewWindowBuilder::new(
-        app,
-        "settings",
-        WebviewUrl::App("/settings".into()),
-    )
-    .title("OneLeaf 设置")
-    .inner_size(700.0, 600.0)
-    .min_inner_size(500.0, 400.0)
-    .resizable(true)
-    .center()
-    .build();
+    // 从主窗口获取 base URL，拼上 #/settings（兼容 dev 和 production）
+    let settings_url = app.get_webview_window("main")
+        .and_then(|w| w.url().ok())
+        .map(|mut u| {
+            u.set_fragment(Some("/settings"));
+            u
+        });
+
+    let url = if let Some(u) = settings_url {
+        WebviewUrl::External(u)
+    } else {
+        WebviewUrl::App("/".into())
+    };
+
+    match WebviewWindowBuilder::new(app, "settings", url)
+        .title("OneLeaf 设置")
+        .inner_size(700.0, 600.0)
+        .min_inner_size(500.0, 400.0)
+        .resizable(true)
+        .center()
+        .build()
+    {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!("[设置窗口] 创建失败: {}", e);
+        }
+    }
 }

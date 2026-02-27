@@ -10,6 +10,10 @@ const MODEL_DOWNLOAD_URL: &str = "https://hf-mirror.com/csukuangfj/sherpa-onnx-s
 const MODEL_FILE: &str = "model.onnx";
 const TOKENS_FILE: &str = "tokens.txt";
 
+// 预估文件大小（字节），当服务器不返回 Content-Length 时使用
+const ESTIMATED_MODEL_SIZE: u64 = 900 * 1024 * 1024; // ~900MB
+const ESTIMATED_TOKENS_SIZE: u64 = 500 * 1024;       // ~500KB
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AsrModelStatus {
     pub name: String,
@@ -97,7 +101,10 @@ pub async fn download_asr_model(app: AppHandle) -> Result<(), String> {
             return Err(format!("下载失败: HTTP {}", response.status()));
         }
 
-        let total_size = response.content_length().unwrap_or(0);
+        let content_length = response.content_length().unwrap_or(0);
+        // 当服务器不返回 Content-Length 时，使用预估大小
+        let estimated = if file_name == MODEL_FILE { ESTIMATED_MODEL_SIZE } else { ESTIMATED_TOKENS_SIZE };
+        let total_size = if content_length > 0 { content_length } else { estimated };
         let mut downloaded: u64 = 0;
 
         let mut file = tokio::fs::File::create(&dest_path).await.map_err(|e| format!("创建文件失败: {}", e))?;
@@ -106,15 +113,18 @@ pub async fn download_asr_model(app: AppHandle) -> Result<(), String> {
         use tokio::io::AsyncWriteExt;
 
         let mut stream = response.bytes_stream();
+        let mut last_emit: u64 = 0;
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| format!("下载错误: {}", e))?;
             file.write_all(&chunk).await.map_err(|e| format!("写入失败: {}", e))?;
 
             downloaded += chunk.len() as u64;
-            let progress = if total_size > 0 { downloaded as f32 / total_size as f32 } else { 0.0 };
+            let progress = (downloaded as f32 / total_size as f32).min(0.99);
 
-            if downloaded % (100 * 1024) < chunk.len() as u64 || downloaded == total_size {
+            // 每 500KB 或首个 chunk 时通知前端
+            if downloaded - last_emit >= 512 * 1024 || last_emit == 0 {
+                last_emit = downloaded;
                 let _ = app.emit("model-download-progress", ModelDownloadProgress {
                     file_name: file_name.clone(),
                     downloaded_bytes: downloaded,
