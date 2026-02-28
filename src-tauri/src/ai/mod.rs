@@ -6,3 +6,4 @@ pub mod service;
 pub mod tantivy_search;
 pub mod document_parser;
 pub mod chunker;
+pub mod memory_manager;

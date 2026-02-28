@@ -148,6 +148,8 @@ impl TantivyIndex {
         &self,
         query_str: &str,
         limit: usize,
+        target_doc_ids: Option<&[String]>,
+        exclude_doc_ids: Option<&[String]>,
     ) -> Result<Vec<FulltextResult>, SearchError> {
         if query_str.trim().is_empty() {
             return Ok(vec![]);
@@ -161,38 +163,64 @@ impl TantivyIndex {
             .parse_query(query_str)
             .map_err(|e| SearchError::SearchFailed(format!("解析查询失败: {}", e)))?;
 
-        let top_docs = searcher
-            .search(&query, &TopDocs::with_limit(limit))
-            .map_err(|e| SearchError::SearchFailed(format!("搜索执行失败: {}", e)))?;
+            let limit_top_docs = if target_doc_ids.is_some() || exclude_doc_ids.is_some() {
+                // 如果有过滤条件，先获取更多的文档，因为部分最终会被过滤掉
+                limit * 5
+            } else {
+                limit
+            };
 
-        let mut results = Vec::new();
+            let top_docs = searcher
+                .search(&query, &TopDocs::with_limit(limit_top_docs))
+                .map_err(|e| SearchError::SearchFailed(format!("搜索执行失败: {}", e)))?;
 
-        for (score, doc_address) in top_docs {
-            let retrieved_doc: TantivyDocument = searcher.doc(doc_address)?;
+            let mut results = Vec::new();
 
-            let doc_id = retrieved_doc
-                .get_first(self.field_doc_id)
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+            for (score, doc_address) in top_docs {
+                let retrieved_doc: TantivyDocument = searcher.doc(doc_address)?;
 
-            let content = retrieved_doc
-                .get_first(self.field_content)
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+                let doc_id = retrieved_doc
+                    .get_first(self.field_doc_id)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
 
-            // 生成摘要片段：找到查询词附近的文本
-            let snippet = self.generate_snippet(content, query_str);
+                // 解析真实的 doc_id (格式 usually UUID_ChunkIndex)
+                let real_doc_id = doc_id.split('_').next().unwrap_or("").to_string();
 
-            results.push(FulltextResult {
-                doc_id,
-                score,
-                snippet,
-                content: content.to_string(),
-            });
-        }
+                // 优先白名单拦截
+                if let Some(targets) = target_doc_ids {
+                    if !targets.contains(&real_doc_id) {
+                        continue; // 不在白名单里，直接丢弃
+                    }
+                } else if let Some(excludes) = exclude_doc_ids {
+                    if excludes.contains(&real_doc_id) {
+                        continue; // 在黑名单里，丢弃
+                    }
+                }
 
-        Ok(results)
+                let content = retrieved_doc
+                    .get_first(self.field_content)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                // 生成摘要片段：找到查询词附近的文本
+                let snippet = self.generate_snippet(content, query_str);
+
+                results.push(FulltextResult {
+                    doc_id,
+                    score,
+                    snippet,
+                    content: content.to_string(),
+                });
+
+                // 如果已经收集够了
+                if results.len() >= limit {
+                    break;
+                }
+            }
+
+            Ok(results)
     }
 
     /// 清除所有索引数据

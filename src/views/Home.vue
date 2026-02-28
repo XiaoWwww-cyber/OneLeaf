@@ -8,7 +8,8 @@ import { marked } from 'marked'
 import {
   ChatDotRound, Document, VideoPlay,
   Fold, Expand, Delete, Search, ArrowDown, EditPen,
-  Paperclip, Lightning, Phone, CopyDocument, More, Top, Setting, Loading
+  Paperclip, Lightning, Phone, CopyDocument, More, Top, Setting, Loading,
+  Collection
 } from '@element-plus/icons-vue'
 import VideoTranscriptDialog from '../components/VideoTranscriptDialog.vue'
 
@@ -171,6 +172,27 @@ const handleChatUploadVideo = async () => {
   } finally {
     isTranscribing.value = false
   }
+}
+
+// ========== 知识库附件（直接挂载引用） ==========
+const kbFileDialogVisible = ref(false)
+const handleChatAttachKbFile = () => {
+  kbFileDialogVisible.value = true
+}
+
+const selectKbDocForChat = (doc: KbDoc) => {
+  // 防止重复添加
+  if (attachedFiles.value.some(a => a.fileId === `KB_FILE:${doc.id}`)) {
+    ElMessage.warning('该文档已经添加')
+    return
+  }
+  attachedFiles.value.push({
+    fileId: `KB_FILE:${doc.id}`,
+    fileType: 'kb_document',
+    fileName: `[KB] ${doc.name}`,
+  })
+  ElMessage.success(`${doc.name} 已选为参考上下文`)
+  kbFileDialogVisible.value = false
 }
 
 const removeAttachment = (index: number) => {
@@ -870,6 +892,13 @@ const openSettings = async () => {
                 <span>上传文件</span>
               </div>
 
+              <div class="action-btn" @click="handleChatAttachKbFile">
+                <el-icon>
+                  <Collection />
+                </el-icon>
+                <span>知识库</span>
+              </div>
+
               <template v-if="isDoubao">
                 <div class="pill-btn web-search-btn" :class="{ active: isWebSearchEnabled }"
                   @click="isWebSearchEnabled = !isWebSearchEnabled">
@@ -1000,6 +1029,17 @@ const openSettings = async () => {
       <template #footer>
         <el-button @click="detailDialogVisible = false">关闭</el-button>
       </template>
+    </el-dialog>
+
+    <!-- 聊天知识库选择弹窗 -->
+    <el-dialog v-model="kbFileDialogVisible" title="选择知识库文件" width="500px">
+      <div class="kb-dialog-list">
+        <div v-if="kbDocuments.length === 0" class="empty-hint" style="color: #666;">暂无知识库文件可以引用</div>
+        <div v-for="doc in kbDocuments" :key="doc.id" class="kb-doc-item" @click="selectKbDocForChat(doc)">
+          <span class="kb-emoji-icon">{{ getDocIcon(doc) }}</span>
+          <span class="kb-dialog-doc-name">{{ doc.name }}</span>
+        </div>
+      </div>
     </el-dialog>
   </div>
 </template>
@@ -1971,5 +2011,39 @@ const openSettings = async () => {
 .markdown-body img {
   max-width: 100%;
   border-radius: 8px;
+}
+
+.kb-dialog-list {
+  max-height: 400px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.kb-doc-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+  background: #f8f9fa;
+  border: 1px solid #ebeef5;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.kb-doc-item:hover {
+  background: #ecf5ff;
+  border-color: #b3d8ff;
+}
+
+.kb-dialog-doc-name {
+  flex: 1;
+  font-weight: 500;
+  color: #303133;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 </style>

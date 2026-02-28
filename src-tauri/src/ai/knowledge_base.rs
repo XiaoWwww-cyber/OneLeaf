@@ -89,7 +89,7 @@ impl Embedder {
 }
 
 pub struct KnowledgeBase {
-    vector_db: Arc<VectorDb>,
+    pub vector_db: Arc<VectorDb>,
     embedder: Arc<Embedder>,
     reranker: Option<Arc<Mutex<OnnxReranker>>>,
     documents: Arc<parking_lot::RwLock<Vec<Document>>>,
@@ -359,11 +359,17 @@ impl KnowledgeBase {
 
 
     /// 搜索相关知识
-    pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>, KbError> {
+    pub async fn search(
+        &self, 
+        query: &str, 
+        limit: usize,
+        target_doc_ids: Option<&[String]>,
+        exclude_doc_ids: Option<&[String]>,
+    ) -> Result<Vec<SearchResult>, KbError> {
         let bge_query = format!("为这个句子生成表示以用于检索相关文章：{}", query);
         let query_embedding = self.embedder.embed(&bge_query)?;
         tracing::info!("Query embedding length: {}", query_embedding.len());
-        let similar_chunks = self.vector_db.search(&query_embedding, limit)?;
+        let similar_chunks = self.vector_db.search(&query_embedding, limit, target_doc_ids, exclude_doc_ids)?;
 
         let documents = self.documents.read();
         let mut results = Vec::new();
@@ -393,10 +399,16 @@ impl KnowledgeBase {
 
     /// 混合检索 (Hybrid Search)
     /// 结合全文搜索(Tantivy)与向量搜索(ONNX)，并使用 RRF 算法进行结果重排融合。
-    pub async fn search_hybrid(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>, KbError> {
+    pub async fn search_hybrid(
+        &self, 
+        query: &str, 
+        limit: usize,
+        target_doc_ids: Option<&[String]>,
+        exclude_doc_ids: Option<&[String]>,
+    ) -> Result<Vec<SearchResult>, KbError> {
         let (vec_res, ft_res) = tokio::join!(
-            self.search(query, limit * 2), // 取两倍候选集确保 RRF 有足够样本
-            self.search_fulltext(query, limit * 2)
+            self.search(query, limit * 2, target_doc_ids, exclude_doc_ids), // 取两倍候选集确保 RRF 有足够样本
+            self.search_fulltext(query, limit * 2, target_doc_ids, exclude_doc_ids)
         );
 
         let vec_results = vec_res.unwrap_or_else(|e| {
@@ -509,8 +521,14 @@ impl KnowledgeBase {
     }
 
     /// 全文搜索（不依赖 AI，使用 Tantivy）
-    pub async fn search_fulltext(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>, KbError> {
-        let ft_results = self.tantivy_index.search(query, limit)?;
+    pub async fn search_fulltext(
+        &self, 
+        query: &str, 
+        limit: usize,
+        target_doc_ids: Option<&[String]>,
+        exclude_doc_ids: Option<&[String]>,
+    ) -> Result<Vec<SearchResult>, KbError> {
+        let ft_results = self.tantivy_index.search(query, limit, target_doc_ids, exclude_doc_ids)?;
         let documents = self.documents.read();
         let mut results = Vec::new();
 
@@ -551,7 +569,11 @@ impl KnowledgeBase {
     }
 
     pub async fn load_conversations(&self) -> Result<Vec<(String, String, String, String)>, KbError> {
-        self.vector_db.load_conversations().map_err(|e| KbError::VectorDbError(e))
+        let rows = self.vector_db.load_conversations().map_err(|e| KbError::VectorDbError(e))?;
+        let res = rows.into_iter().map(|(id, title, created_at, updated_at, _summary, _last_msg)| {
+            (id, title, created_at, updated_at)
+        }).collect();
+        Ok(res)
     }
 
     pub async fn delete_conversation(&self, session_id: &str) -> Result<(), KbError> {
@@ -599,6 +621,39 @@ impl KnowledgeBase {
         }
         
         Ok(results)
+    }
+
+    /// 获取短时记忆窗口的最近几条消息
+    pub async fn load_recent_messages(&self, session_id: &str, limit: usize) -> Result<Vec<(String, String, String, String, String)>, KbError> {
+        // 由于 load_messages 是全量拉取并按 ASC 排序，我们需要从末尾截取
+        let mut all_msgs = self.vector_db.load_messages(session_id).map_err(|e| KbError::VectorDbError(e))?;
+        if all_msgs.len() > limit {
+            let skip_count = all_msgs.len() - limit;
+            all_msgs = all_msgs.into_iter().skip(skip_count).collect();
+        }
+        Ok(all_msgs)
+    }
+
+    /// 获取当前会话的滚动摘要
+    pub async fn get_conversation_summary(&self, session_id: &str) -> Result<Option<String>, KbError> {
+        self.vector_db.get_conversation_summary(session_id).map_err(|e| KbError::VectorDbError(e))
+    }
+
+    /// 更新会话摘要记录
+    pub async fn update_conversation_summary(&self, session_id: &str, summary: &str, last_msg_id: &str) -> Result<(), KbError> {
+        self.vector_db.update_conversation_summary(session_id, summary, last_msg_id).map_err(|e| KbError::VectorDbError(e))
+    }
+
+    // ==========================================
+    // 用户画像管理 (User Profiles)
+    // ==========================================
+
+    pub async fn save_user_profile(&self, key: &str, value: &str) -> Result<(), KbError> {
+        self.vector_db.save_user_profile(key, value).map_err(|e| KbError::VectorDbError(e))
+    }
+
+    pub async fn load_user_profiles(&self) -> Result<Vec<(String, String)>, KbError> {
+        self.vector_db.load_user_profiles().map_err(|e| KbError::VectorDbError(e))
     }
 }
 

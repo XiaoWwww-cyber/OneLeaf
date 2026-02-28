@@ -84,11 +84,17 @@ impl VectorDb {
             "CREATE TABLE IF NOT EXISTS conversations (
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
+                summary TEXT,
+                last_summarized_msg_id TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )",
             [],
         )?;
+        
+        // 数据库迁移：为旧表添加新列（如果不存在）
+        let _ = conn.execute("ALTER TABLE conversations ADD COLUMN summary TEXT", []);
+        let _ = conn.execute("ALTER TABLE conversations ADD COLUMN last_summarized_msg_id TEXT", []);
 
         // 消息表
         conn.execute(
@@ -110,6 +116,16 @@ impl VectorDb {
                 embedding BLOB NOT NULL,
                 dimension INTEGER NOT NULL,
                 created_at TEXT NOT NULL
+            )",
+            [],
+        )?;
+
+        // 全局用户画像表
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS user_profiles (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                extracted_at TEXT NOT NULL
             )",
             [],
         )?;
@@ -185,22 +201,38 @@ impl VectorDb {
 
     pub fn save_conversation(&self, id: &str, title: &str, created_at: &str, updated_at: &str) -> Result<(), VectorDbError> {
         let conn = self.conn.lock().unwrap();
+        // 因为是保存新的对话或更新基础信息，保留现有的 summary
         conn.execute(
-            "INSERT OR REPLACE INTO conversations (id, title, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO conversations (id, title, created_at, updated_at) 
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET 
+             title = excluded.title, 
+             updated_at = excluded.updated_at",
             params![id, title, created_at, updated_at],
         ).map_err(|e| VectorDbError::InsertFailed(e.to_string()))?;
         Ok(())
     }
 
-    pub fn load_conversations(&self) -> Result<Vec<(String, String, String, String)>, VectorDbError> {
+    pub fn update_conversation_summary(&self, id: &str, summary: &str, last_msg_id: &str) -> Result<(), VectorDbError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT id, title, created_at, updated_at FROM conversations ORDER BY updated_at DESC")?;
+        conn.execute(
+            "UPDATE conversations SET summary = ?2, last_summarized_msg_id = ?3 WHERE id = ?1",
+            params![id, summary, last_msg_id],
+        ).map_err(|e| VectorDbError::InsertFailed(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn load_conversations(&self) -> Result<Vec<(String, String, String, String, Option<String>, Option<String>)>, VectorDbError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id, title, created_at, updated_at, summary, last_summarized_msg_id FROM conversations ORDER BY updated_at DESC")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
             ))
         })?;
         
@@ -209,6 +241,17 @@ impl VectorDb {
             list.push(row?);
         }
         Ok(list)
+    }
+
+    pub fn get_conversation_summary(&self, id: &str) -> Result<Option<String>, VectorDbError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT summary FROM conversations WHERE id = ?1")?;
+        let mut rows = stmt.query([id])?;
+        if let Some(row) = rows.next()? {
+            Ok(row.get(0)?)
+        } else {
+            Ok(None)
+        }
     }
 
     pub fn delete_conversation(&self, session_id: &str) -> Result<(), VectorDbError> {
@@ -266,6 +309,37 @@ impl VectorDb {
         }
     }
 
+    // ==========================================
+    // 用户画像管理 (User Profiles)
+    // ==========================================
+
+    pub fn save_user_profile(&self, key: &str, value: &str) -> Result<(), VectorDbError> {
+        let created_at = chrono::Utc::now().to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO user_profiles (key, value, extracted_at) VALUES (?1, ?2, ?3)",
+            params![key, value, created_at],
+        ).map_err(|e| VectorDbError::InsertFailed(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn load_user_profiles(&self) -> Result<Vec<(String, String)>, VectorDbError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT key, value FROM user_profiles")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+            ))
+        })?;
+        
+        let mut list = Vec::new();
+        for row in rows {
+            list.push(row?);
+        }
+        Ok(list)
+    }
+
     /// 获取当前数据库中存储的向量维度
     pub fn get_dimension(&self) -> Result<usize, VectorDbError> {
         let conn = self.conn.lock().unwrap();
@@ -295,6 +369,21 @@ impl VectorDb {
         Ok(())
     }
 
+    /// 获取文档的所有 Chunks (按 chunk_index 排序)
+    pub fn get_document_chunks(&self, document_id: &str) -> Result<Vec<String>, VectorDbError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT chunk_content FROM document_vectors WHERE document_id = ?1 ORDER BY chunk_index ASC")?;
+        let rows = stmt.query_map([document_id], |row| {
+            row.get(0)
+        })?;
+        
+        let mut chunks = Vec::new();
+        for row in rows {
+            chunks.push(row?);
+        }
+        Ok(chunks)
+    }
+
     /// 插入消息向量
     pub fn insert_message_vector(&self, message_id: &str, session_id: &str, embedding: &[f32]) -> Result<(), VectorDbError> {
         let embedding_bytes = self.f32_slice_to_bytes(embedding);
@@ -316,14 +405,50 @@ impl VectorDb {
         &self,
         query_embedding: &[f32],
         limit: usize,
+        target_doc_ids: Option<&[String]>,
+        exclude_doc_ids: Option<&[String]>,
     ) -> Result<Vec<(String, usize, String, f32)>, VectorDbError> {
         let conn = self.conn.lock().unwrap();
+        
+        // 动态构建 WHERE 条件
+        let mut query = String::from("SELECT document_id, chunk_index, chunk_content, embedding, dimension FROM document_vectors");
+        let mut conditions = Vec::new();
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        if let Some(targets) = target_doc_ids {
+            if !targets.is_empty() {
+                let placeholders = vec!["?"; targets.len()].join(", ");
+                conditions.push(format!("document_id IN ({})", placeholders));
+                for id in targets {
+                    params.push(Box::new(id.clone()));
+                }
+            } else {
+                // 如果给定了 targets 但为空，则什么也搜不到
+                return Ok(Vec::new());
+            }
+        } else if let Some(excludes) = exclude_doc_ids {
+            if !excludes.is_empty() {
+                let placeholders = vec!["?"; excludes.len()].join(", ");
+                conditions.push(format!("document_id NOT IN ({})", placeholders));
+                for id in excludes {
+                    params.push(Box::new(id.clone()));
+                }
+            }
+        }
+
+        if !conditions.is_empty() {
+            query.push_str(" WHERE ");
+            query.push_str(&conditions.join(" AND "));
+        }
+
+        // 将 Box 转换回 dyn ToSql，以用于 rusqlite 的查询
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| &**p).collect();
         let mut stmt = conn
-            .prepare("SELECT document_id, chunk_index, chunk_content, embedding, dimension FROM document_vectors")
+            .prepare(&query)
             .map_err(|e| VectorDbError::SearchFailed(e.to_string()))?;
 
         let rows = stmt
-            .query_map([], |row| {
+            .query_map(rusqlite::params_from_iter(param_refs), |row| {
                 let document_id: String = row.get(0)?;
                 let chunk_index: i32 = row.get(1)?;
                 let chunk_content: String = row.get(2)?;

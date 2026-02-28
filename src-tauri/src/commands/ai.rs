@@ -17,6 +17,15 @@ static KNOWLEDGE_BASE: Lazy<Arc<Mutex<Option<KnowledgeBase>>>> =
 pub static AI_SERVICE: Lazy<Arc<Mutex<AiService>>> =
     Lazy::new(|| Arc::new(Mutex::new(AiService::new())));
 
+// 全局内存储存总结器实例
+pub static MEMORY_MANAGER: Lazy<Arc<crate::ai::memory_manager::MemoryManager>> =
+    Lazy::new(|| {
+        Arc::new(crate::ai::memory_manager::MemoryManager::new(
+            KNOWLEDGE_BASE.clone(),
+            AI_SERVICE.clone(),
+        ))
+    });
+
 /// AI 设置结构
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiSettings {
@@ -96,10 +105,10 @@ pub async fn search_knowledge_base(query: String, limit: usize) -> Result<Vec<Se
 
     if kb.has_semantic_embedder() {
         info!("使用向量语义搜索: {}", query);
-        kb.search(&query, limit).await.map_err(|e| e.to_string())
+        kb.search(&query, limit, None, None).await.map_err(|e| e.to_string())
     } else {
         info!("使用 Tantivy 全文搜索: {}", query);
-        kb.search_fulltext(&query, limit).await.map_err(|e| e.to_string())
+        kb.search_fulltext(&query, limit, None, None).await.map_err(|e| e.to_string())
     }
 }
 
@@ -156,7 +165,7 @@ pub async fn save_text_as_temp_file(
 #[tauri::command]
 pub async fn chat_with_ai(
     app: AppHandle,
-    messages: Vec<ChatMessage>,
+    mut messages: Vec<ChatMessage>,
     session_id: Option<String>,
     enable_web_search: Option<bool>,
     thinking_depth: Option<String>,
@@ -167,6 +176,7 @@ pub async fn chat_with_ai(
 
     let sid = session_id.clone().unwrap_or_else(|| "default".to_string());
     let mut valid_attachments = Vec::new();
+    let mut kb_attachments = Vec::new();
     let mut local_attachments_text = String::new();
 
     for att in raw_attachments {
@@ -184,18 +194,77 @@ pub async fn chat_with_ai(
                     warn!("❌ 无法解析本地附件 {}: {}", file_path_str, e);
                 }
             }
+        } else if att.file_id.starts_with("KB_FILE:") {
+            // 这是我们要新增的知识库内联文件逻辑
+            kb_attachments.push(att);
         } else {
             valid_attachments.push(att);
         }
     }
-    info!("附件处理完毕: local_text_len={}, valid_cloud_attachments={}", local_attachments_text.len(), valid_attachments.len());
+    info!("附件处理完毕: local_text_len={}, valid_cloud_attachments={}, kb_attachments={}", local_attachments_text.len(), valid_attachments.len(), kb_attachments.len());
+    let kb_opt = KNOWLEDGE_BASE.lock().as_ref().cloned();
 
-    // 1. 获取最后一条用户消息用于 RAG 搜索
+    // =============== Length-Adaptive Routing 分发逻辑 ===============
+    let mut exclude_doc_ids = Vec::new();
+    let mut target_doc_ids = Vec::new();
+
+    if let Some(kb) = &kb_opt {
+        for kb_att in kb_attachments {
+            let doc_id = kb_att.file_id.trim_start_matches("KB_FILE:");
+            // 提取所有的 chunk
+            if let Ok(chunks) = kb.vector_db.get_document_chunks(doc_id) {
+                let full_text = chunks.join("\n");
+                let char_len = full_text.chars().count();
+                
+                info!("知识库附件 {} 提取出 {} 段 chunk，字符总长度: {}", doc_id, chunks.len(), char_len);
+
+                if char_len < 8000 {
+                    // 情况 A: 小文件，全文注入
+                    local_attachments_text.push_str(&format!("【知识库文件全文提取：{}】:\n{}\n\n", kb_att.file_name, full_text));
+                    exclude_doc_ids.push(doc_id.to_string());
+                    info!(" -> 长度 < 8000 字符，执行【全文注入】，并将该文件加入 RAG 屏蔽黑名单。");
+                } else {
+                    // 情况 B: 巨无霸大文件，退化为单文档 RAG
+                    target_doc_ids.push(doc_id.to_string());
+                    info!(" -> 长度 >= 8000 字符，跳过文段组装防溢出，将该文件加入专属 RAG 白名单。");
+                }
+            } else {
+                warn!("提取该知识库文档片段失败: {}", doc_id);
+            }
+        }
+    }
+    
+    // 如果没有 target 且 exclude 为空，就传 None 以优化底层查询
+    let target_opt = if target_doc_ids.is_empty() { None } else { Some(target_doc_ids.as_slice()) };
+    let exclude_opt = if exclude_doc_ids.is_empty() { None } else { Some(exclude_doc_ids.as_slice()) };
+    
+    // =========================================================================
+    // 分层长时记忆引擎 (Hierarchical Memory Engine) - 上下文组装流水线
+    // 层级1: 全局用户画像 (User Profile)
+    // 层级2: RAG 知识库与长期记忆碎片 (Long-term Context)
+    // 层级3: 本会话中期滚动摘要 (Mid-term Summary)
+    // 层级4: 近期滑动窗口 (Short-term context) 保留最后几轮作为真实交互
+    // 层级5: 联网扩展 (Web Search) - 可选
+    // =========================================================================
+
+    // 获取用户发送的最后一句话，用于各种检索
     let last_user_msg = messages.last().filter(|m| m.role == "user").map(|m| m.content.clone());
 
-    // 2. RAG 搜索（知识库已初始化时）
-    let kb_opt = KNOWLEDGE_BASE.lock().clone();
+    // 1. 获取全局用户画像 (User Profile)
+    let mut user_profile_context = String::new();
+    if let Some(kb) = &kb_opt {
+        if let Ok(profiles) = kb.load_user_profiles().await {
+            if !profiles.is_empty() {
+                let profile_str = profiles.iter()
+                    .map(|(k, v)| format!("- {}: {}", k, v))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                user_profile_context = format!("【用户专属画像设定】:\n{}\n\n", profile_str);
+            }
+        }
+    }
 
+    // 2. 长时知识库 RAG (文档 + 历史对话切片)
     let mut rag_context = if let Some(query) = &last_user_msg {
         if let Some(kb) = &kb_opt {
             let doc_count = kb.list_documents().await.map(|d| d.len()).unwrap_or(0);
@@ -203,9 +272,9 @@ pub async fn chat_with_ai(
             
             let (results, search_type) = if kb.has_semantic_embedder() {
                 // 有 AI 模型时直接调用强大的双路混合检索 (语义 + 全文 RRF)
-                (kb.search_hybrid(query, 10).await.ok(), "混合检索 (语义 + 全文 RRF)")
+                (kb.search_hybrid(query, 10, target_opt, exclude_opt).await.ok(), "混合检索 (语义 + 全文 RRF)")
             } else {
-                (kb.search_fulltext(query, 10).await.ok(), "全文检索 (降级)")
+                (kb.search_fulltext(query, 10, target_opt, exclude_opt).await.ok(), "全文检索 (降级)")
             };
 
             info!("使用 {} 模式进行检索", search_type);
@@ -293,7 +362,7 @@ pub async fn chat_with_ai(
         None
     };
 
-    // --- 长时记忆（RAG 搜索历史聊天记录） ---
+    // 长时记忆 (历史对话切片)
     let mut history_context = None;
     if let Some(query) = &last_user_msg {
         if let Some(kb) = &kb_opt {
@@ -304,13 +373,23 @@ pub async fn chat_with_ai(
                         let ctx = sim_msgs
                             .iter()
                             .map(|(_msg_id, _session_id, content)| {
-                                format!("【历史参考对话片段】：{}", content)
+                                format!("【关联的历史记忆片段】: {}", content)
                             })
                             .collect::<Vec<_>>()
                             .join("\n");
                         history_context = Some(ctx);
                     }
                 }
+            }
+        }
+    }
+
+    // 3. 获取跨轮次的滚动中期摘要 (Mid-term Summary)
+    let mut summary_context = None;
+    if let Some(kb) = &kb_opt {
+        if let Ok(Some(summary)) = kb.get_conversation_summary(&sid).await {
+            if !summary.trim().is_empty() {
+                summary_context = Some(format!("【本轮对话此前的滚动摘要】:\n{}\n\n", summary));
             }
         }
     }
@@ -361,76 +440,95 @@ pub async fn chat_with_ai(
         };
     }
 
-    // 4. 构建系统提示词与上下文
-    let mut final_messages = messages.clone();
-
-    // 有本地附件时，使用极简注入策略（复刻 LM Studio inject-full-content）
-    // 不加冗余系统提示词，直接把文件原文拼在用户消息前面
+    // 4. 构建三明治上下文 (The Sandwich Prompt)
+    
+    // 如果存在本地附件，执行 Inject-full-content 策略，将原文顶在用户前段
     if !local_attachments_text.is_empty() {
         info!("使用本地附件注入策略 (inject-full-content)，附件文本长度: {} 字符", local_attachments_text.len());
-        if let Some(last_msg) = final_messages.last_mut().filter(|m| m.role == "user") {
+        if let Some(last_msg) = messages.last_mut().filter(|m| m.role == "user") {
             let original_content = last_msg.content.clone();
-            last_msg.content = format!(
-                "{}\n\n{}", 
-                local_attachments_text.trim(), original_content
-            );
-            info!("已将附件内容注入用户消息，最终长度: {} 字符", last_msg.content.len());
-        }
-    } else {
-        // 无本地附件：使用标准 RAG 系统提示词
-        let mut context_prompt = String::from(
-            "你是 OneLeaf 智能知识库助手。\n\
-             请仔细阅读以下【参考知识】，并以此来回答用户的问题。\n\
-             如果【参考知识】中没有与用户问题相关的内容，请忽略这些参考知识，\n\
-             直接使用你自己的基础知识来回答，并向用户说明你是基于通用知识回答的。\n\
-             切勿牵强附会地将不相关的参考知识硬塞进回答中。\n\n",
-        );
-
-        if let Some((ref ctx, _)) = rag_context {
-            context_prompt.push_str("【参考知识】：\n");
-            context_prompt.push_str(ctx);
-            context_prompt.push_str("\n\n");
-        } 
-
-        if let Some(ref hist_ctx) = history_context {
-            context_prompt.push_str("【历史跨会话聊天记忆】：\n");
-            context_prompt.push_str(hist_ctx);
-            context_prompt.push_str("\n\n");
-        }
-
-        if rag_context.is_some() || history_context.is_some() {
-            context_prompt.push_str("(请根据以上内容回答。若参考内容与问题无关或不充分，请结合自身知识回答。)\n\n");
-        } else {
-            if let Some(kb) = &kb_opt {
-                 if let Ok(docs) = kb.list_documents().await {
-                     if !docs.is_empty() {
-                         context_prompt.push_str("\n【提示】：系统中存在以下文档，但由于未加载深度语义模型，全文搜索未能直接定位到匹配的文字片段。请基于常识回答，并告知用户参考这些文档名：\n");
-                         for doc in docs.iter().take(5) {
-                             context_prompt.push_str(&format!("- {}\n", doc.name));
-                         }
-                     }
-                 }
-            }
-        }
-
-        info!("最终 context_prompt 长度: {} 字符", context_prompt.len());
-        if let Some(last_msg) = final_messages.last_mut().filter(|m| m.role == "user") {
-            let original_content = last_msg.content.clone();
-            last_msg.content = format!(
-                "{}\n\n=== 用户提问 ===\n{}", 
-                context_prompt, original_content
-            );
-            info!("已将 context_prompt 注入最后一条用户消息，最终长度: {} 字符", last_msg.content.len());
-        } else {
-            final_messages.insert(
-                0,
-                ChatMessage {
-                    role: "system".to_string(),
-                    content: context_prompt,
-                },
-            );
+            last_msg.content = format!("{}\n\n{}", local_attachments_text.trim(), original_content);
         }
     }
+
+    // 将底层系统设定开始拼接
+    let mut context_prompt = String::from("=================== [核心系统指令] ===================\n");
+    context_prompt.push_str("你是 OneLeaf 智能交互助手。请仔细领会并使用以下各个层级的上下文进行回复。\n");
+    if !user_profile_context.is_empty() {
+        context_prompt.push_str(&user_profile_context);
+    }
+    
+    context_prompt.push_str("\n=================== [中长期上下文层] ===================\n");
+    let mut has_mid_long_term = false;
+
+    if let Some((ref ctx, _)) = rag_context {
+        context_prompt.push_str("【文档参考片段】:\n");
+        context_prompt.push_str(ctx);
+        context_prompt.push_str("\n\n");
+        has_mid_long_term = true;
+    } 
+
+    if let Some(ref hist_ctx) = history_context {
+        context_prompt.push_str(hist_ctx);
+        context_prompt.push_str("\n\n");
+        has_mid_long_term = true;
+    }
+
+    if let Some(ref sum_ctx) = summary_context {
+        context_prompt.push_str(sum_ctx);
+        has_mid_long_term = true;
+    }
+
+    if !has_mid_long_term {
+        // 全都没有命中长时记忆，也发一个占位告诉 LLM
+        if let Some(kb) = &kb_opt {
+             if let Ok(docs) = kb.list_documents().await {
+                 if !docs.is_empty() {
+                     context_prompt.push_str("系统中存在文档，全文搜索未能直接定位到片段。由于无具体参考片段提供，你可以直接基于广泛的常规知识进行解答。\n\n");
+                 }
+             }
+        }
+    } else {
+         context_prompt.push_str("(如果上方上下文对解答毫无帮助，请果断忽略这些强制召回的片段，利用常识回答即可。)\n\n");
+    }
+
+    // 将重构的系统 Prompt 塞入原本 final_messages 的系统层
+    let mut final_messages: Vec<ChatMessage> = Vec::new();
+
+    // 插入组装好的复杂提示词作为 System Prompt 第一句
+    final_messages.push(ChatMessage {
+        role: "system".to_string(),
+        content: context_prompt,
+    });
+
+    // 这里有个潜在问题：如果 messages 从前端传过来本身就有历史对话记录（比如长度高达20条）
+    // 就会引发冗余爆单。我们要截断短时记忆滑动窗口！
+    // 假设前端原样发送了最近的 6 条（短时上下文）。
+    // 将前端传来的 messages 过滤出有意义的对话追加进去（非系统的最后一句话保留）
+    let max_short_term_rounds = 8; // 8 条即 4 轮
+    let msg_count = messages.len();
+    let start_idx = if msg_count > max_short_term_rounds { msg_count - max_short_term_rounds } else { 0 };
+
+    for msg in messages.into_iter().skip(start_idx) {
+        if msg.role != "system" {
+            final_messages.push(msg);
+        }
+    }
+
+    info!("三明治 Prompt 构建完毕，System 层长度: {} 字符，携带会话短时记忆数量: {}", final_messages[0].content.len(), final_messages.len() - 1);
+
+    let manager = MEMORY_MANAGER.clone();
+    let trigger_sid = sid.clone();
+    let trigger_sid_2 = sid.clone();
+    tokio::spawn(async move {
+        // 每当用户说话，都有概率或直接触发记忆检查
+        manager.trigger_check(trigger_sid).await;
+        
+        // 简单策略：随机或基于次数触发用户画像提取
+        if msg_count > 0 && msg_count % 5 == 0 {
+            manager.trigger_profile_extraction(trigger_sid_2).await;
+        }
+    });
 
     // 5. 调用 AI 服务（豆包走流式，其他走非流式）
     info!("调用 AI 服务...");
