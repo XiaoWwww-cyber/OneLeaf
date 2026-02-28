@@ -52,6 +52,10 @@ impl Default for AiSettings {
 
 #[tauri::command]
 pub async fn init_knowledge_base(app: AppHandle, db_path: String) -> Result<(), String> {
+    if KNOWLEDGE_BASE.lock().is_some() {
+        info!("知识库已在运行中，跳过重复初始化日志");
+        return Ok(());
+    }
     info!("初始化知识库...");
     let path = if db_path.is_empty() {
         app.path().app_data_dir().unwrap().join("knowledge_base.db")
@@ -223,6 +227,20 @@ pub async fn chat_with_ai(
                     local_attachments_text.push_str(&format!("【知识库文件全文提取：{}】:\n{}\n\n", kb_att.file_name, full_text));
                     exclude_doc_ids.push(doc_id.to_string());
                     info!(" -> 长度 < 8000 字符，执行【全文注入】，并将该文件加入 RAG 屏蔽黑名单。");
+                    
+                    // 补充发出 citation
+                    let explicit_citation = serde_json::json!([{
+                        "id": doc_id,
+                        "name": kb_att.file_name.replace("[KB] ", ""),
+                        "category": "指定参考文件"
+                    }]);
+                    let citations_json = serde_json::to_string(&explicit_citation).unwrap_or_default();
+                    let _ = app.emit("ai-stream-chunk", &StreamChunk {
+                        session_id: sid.clone(),
+                        chunk_type: "citations".to_string(),
+                        delta: citations_json,
+                        done: false,
+                    });
                 } else {
                     // 情况 B: 巨无霸大文件，退化为单文档 RAG
                     target_doc_ids.push(doc_id.to_string());
@@ -320,6 +338,8 @@ pub async fn chat_with_ai(
                     let mut current_len = 0;
                     let mut final_ctx_blocks = Vec::new();
                     let mut final_results = Vec::new();
+                    let mut citations = Vec::new();
+                    let mut seen_doc_ids = std::collections::HashSet::new();
 
                     for (i, r) in results.into_iter().enumerate() {
                         let block = format!("【参考片段 {}】(来源文件: {} | 分类: {} | 录入时间: {})\n内容: {}\n", 
@@ -334,6 +354,16 @@ pub async fn chat_with_ai(
                         
                         current_len += block_len;
                         final_ctx_blocks.push(block);
+                        
+                        // 收集去重的引用信息
+                        if seen_doc_ids.insert(r.document.id.clone()) {
+                            citations.push(serde_json::json!({
+                                "id": r.document.id,
+                                "name": r.document.name,
+                                "category": r.document.category
+                            }));
+                        }
+                        
                         final_results.push(r.clone());
                         info!("加入上下文: [{}] Chunk {} (相关度: {}, 累计长度: {})", r.document.name, r.chunk_index, r.relevance, current_len);
                         
@@ -342,6 +372,17 @@ pub async fn chat_with_ai(
                             info!("达到最大截断片段数 (10 个)");
                             break;
                         }
+                    }
+
+                    // 如果有有效的引用，通过单独的 chunk 提前下发给前端
+                    if !citations.is_empty() {
+                        let citations_json = serde_json::to_string(&citations).unwrap_or_default();
+                        let _ = app.emit("ai-stream-chunk", &StreamChunk {
+                            session_id: sid.clone(),
+                            chunk_type: "citations".to_string(),
+                            delta: citations_json,
+                            done: false,
+                        });
                     }
 
                     let ctx = final_ctx_blocks.join("\n\n");
@@ -515,7 +556,7 @@ pub async fn chat_with_ai(
         }
     }
 
-    info!("三明治 Prompt 构建完毕，System 层长度: {} 字符，携带会话短时记忆数量: {}", final_messages[0].content.len(), final_messages.len() - 1);
+    info!("Prompt 构建完毕，System 层长度: {} 字符，携带会话短时记忆数量: {}", final_messages[0].content.len(), final_messages.len() - 1);
 
     let manager = MEMORY_MANAGER.clone();
     let trigger_sid = sid.clone();
@@ -577,6 +618,10 @@ pub async fn chat_with_ai(
         {
             Ok(response) => {
                 info!("AI 对话成功");
+                // 通知前端结束，确保非流式模式下 UI 正确切换
+                let _ = app.emit("ai-stream-done", serde_json::json!({
+                    "session_id": sid,
+                }));
                 Ok(response)
             }
             Err(e) => {

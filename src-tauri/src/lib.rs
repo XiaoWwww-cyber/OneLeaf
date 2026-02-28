@@ -52,7 +52,9 @@ pub fn run() {
 
             tracing_subscriber::registry()
                 .with(tracing_subscriber::EnvFilter::from_default_env()
-                    .add_directive(tracing::Level::INFO.into()))
+                    .add_directive(tracing::Level::INFO.into())
+                    .add_directive("tantivy=warn".parse().unwrap())
+                    .add_directive("ort=warn".parse().unwrap()))
                 .with(tracing_subscriber::fmt::layer().with_writer(std::io::stdout))
                 .with(tracing_subscriber::fmt::layer().with_writer(non_blocking).with_ansi(false))
                 .init();

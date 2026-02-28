@@ -211,6 +211,7 @@ impl KnowledgeBase {
 
         // 如果需要重建向量及索引 (Chunk 改造)
         if needs_reembed {
+            let _ = vector_db.clear_document_vectors(); // 清除旧的全部向量，避免遗留错误维度的残骸
             let _ = tantivy_index.clear_all();
             for (id, name, content) in docs_to_reembed {
                 let chunks = crate::ai::chunker::chunk_text(&content, 800, 100);

@@ -42,8 +42,8 @@ impl OnnxEmbedder {
         let tokenizer = BertTokenizer::from_file(&vocab_path, true, true)
             .map_err(|e| EmbedderError::TokenizerLoad(format!("无法加载词表: {:?}", e)))?;
 
-        // BGE-small-zh 的隐藏层大小是 512
-        let hidden_size = 512;
+        // 使用 BGE-base-zh 的隐藏层大小 768
+        let hidden_size = 768;
 
         Ok(Self {
             session,

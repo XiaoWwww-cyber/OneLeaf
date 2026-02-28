@@ -188,9 +188,10 @@ impl VectorDb {
         Ok(docs)
     }
 
-    /// 删除文档元数据
+    /// 删除文档元数据及对应的向量
     pub fn delete_document(&self, id: &str) -> Result<(), VectorDbError> {
         let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM document_vectors WHERE document_id = ?1", params![id])?;
         conn.execute("DELETE FROM documents WHERE id = ?1", params![id])?;
         Ok(())
     }
@@ -543,6 +544,13 @@ impl VectorDb {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM document_vectors", [])?;
         conn.execute("DELETE FROM documents", [])?;
+        Ok(())
+    }
+
+    /// 仅清除文档的向量数据（保留 meta）
+    pub fn clear_document_vectors(&self) -> Result<(), VectorDbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM document_vectors", [])?;
         Ok(())
     }
 

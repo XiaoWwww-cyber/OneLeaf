@@ -37,6 +37,7 @@ interface Message {
   thinking?: string
   answer?: string
   thinkingDone?: boolean
+  citations?: Array<{ id: string, name: string, category: string }>
 }
 const messages = ref<Message[]>([])
 const inputText = ref('')
@@ -330,9 +331,11 @@ const handleOpenFile = async (doc: KbDoc) => {
 
 // ========== 初始化 ==========
 onMounted(async () => {
-  // 1. 知识库初始化
+  // 1. 知识库加载/检查
   try {
     await invoke('init_knowledge_base', { dbPath: '' })
+    // 加载完后立即拉取一次列表
+    await refreshDocuments()
   } catch (e) {
     console.warn('KB init:', e)
   }
@@ -468,14 +471,16 @@ const handleSend = async () => {
     // 检查是否被用户中断
     if (stopStreamFlag) return
 
-    // 第一个 chunk 到来时，关闭 loading 并推入消息
-    if (!streamStarted) {
+    // 第一个 内容 chunk (正文或思考) 到来时，关闭全屏 loading
+    if (!streamStarted && (chunk.chunk_type === 'text' || chunk.chunk_type === 'thinking')) {
       streamStarted = true
       loadingMap[currentSessionId] = false
       if (activeConversationId.value === currentSessionId) {
-        messages.value.push(streamMsg)
-        // 取回 reactive proxy 引用，确保后续修改能触发 Vue re-render
-        msgProxy = messages.value[messages.value.length - 1]
+        // 如果引用包没来，消息还没推，则在此处推入
+        if (!messages.value.find(m => m.id === replyId)) {
+          messages.value.push(streamMsg)
+          msgProxy = messages.value[messages.value.length - 1]
+        }
       }
     }
 
@@ -501,10 +506,51 @@ const handleSend = async () => {
       streamThinking += chunk.delta
       msgProxy.thinking = streamThinking
       msgProxy.thinkingDone = false // 确保在思考中
+    } else if (chunk.chunk_type === 'citations') {
+      // 引用先到，此时可能还没推消息（!streamStarted）
+      // 我们先推入占位消息，方便展示引用标签，但【不关闭】全局 loading
+      if (!streamStarted && activeConversationId.value === currentSessionId) {
+        if (!messages.value.find(m => m.id === replyId)) {
+          messages.value.push(streamMsg)
+          msgProxy = messages.value[messages.value.length - 1]
+        }
+      }
+
+      try {
+        const data = JSON.parse(chunk.delta)
+        if (!msgProxy.citations) {
+          msgProxy.citations = []
+        }
+        for (const item of data) {
+          if (!msgProxy.citations.find(c => c.id === item.id)) {
+            msgProxy.citations.push(item)
+          }
+        }
+      } catch (e) {
+        console.error('Failed to parse citations:', e)
+      }
     }
 
     triggerRef(messages)
     scrollToBottom()
+  })
+
+  // 监听流生成结束（针对非流式 Provider 或完成状态同步）
+  const unlistenDone = await listen<any>('ai-stream-done', (event) => {
+    const payload = event.payload
+    if (payload.session_id !== currentSessionId) return
+
+    // 如果还没开始流（非流式 Provider），则在此处标记开始并推入消息
+    if (!streamStarted) {
+      streamStarted = true
+      loadingMap[currentSessionId] = false
+      if (activeConversationId.value === currentSessionId) {
+        if (!messages.value.find(m => m.id === replyId)) {
+          messages.value.push(streamMsg)
+          msgProxy = messages.value[messages.value.length - 1]
+        }
+      }
+    }
   })
 
   try {
@@ -526,18 +572,28 @@ const handleSend = async () => {
       attachments: currentAttachments.length > 0 ? currentAttachments : null,
     })
 
-    // 对于非流式 Provider，reply 是完整文本
-    // 对于豆包(流式)，reply 也是完整文本（流式 callback 已实时填充）
-    // 确保最终 streamMsg.content 有值
-    if (!streamStarted && reply) {
-      // 非流式情况下，用完整 reply 填充并推入列表
+    // 补齐/更新逻辑：针对非流式 Provider (如 LM Studio)
+    // 即使 citations 触发了 streamStarted，只要正文还是空的，就用 reply 填充
+    if (reply && (!streamFullText || streamFullText.trim() === '')) {
       const parsed = parseMessage({ id: replyId, role: 'assistant', content: reply })
-      streamMsg.content = parsed.content
-      streamMsg.thinking = parsed.thinking
-      streamMsg.answer = parsed.answer
-      streamMsg.thinkingDone = parsed.thinkingDone // 核心修复：同步思考状态
-      if (activeConversationId.value === currentSessionId) {
-        messages.value.push(streamMsg)
+      if (!streamStarted) {
+        streamStarted = true
+        loadingMap[currentSessionId] = false
+        streamMsg.content = parsed.content
+        streamMsg.thinking = parsed.thinking
+        streamMsg.answer = parsed.answer
+        streamMsg.thinkingDone = parsed.thinkingDone
+        if (activeConversationId.value === currentSessionId) {
+          if (!messages.value.find(m => m.id === replyId)) {
+            messages.value.push(streamMsg)
+          }
+        }
+      } else {
+        // 已经推过了（例如推过引用了），直接更新 proxy
+        msgProxy.content = parsed.content
+        msgProxy.thinking = parsed.thinking
+        msgProxy.answer = parsed.answer
+        msgProxy.thinkingDone = parsed.thinkingDone
       }
     }
 
@@ -563,6 +619,7 @@ const handleSend = async () => {
     }
   } finally {
     unlisten()
+    unlistenDone()
     loadingMap[currentSessionId] = false
     await scrollToBottom()
   }
@@ -838,14 +895,35 @@ const openSettings = async () => {
                     :model-value="!msg.thinkingDone" :content="msg.thinking" button-width="180px" max-width="100%"
                     background-color="#2a2a2a" color="#d1d1d1" style="margin-bottom: 8px;" />
                   <div class="answer-text markdown-body" v-html="renderMarkdown(msg.answer || msg.content)"></div>
+
+                  <!-- 如果没正文（只有引用或刚开始），显示气泡内 loading -->
+                  <div v-if="!msg.content && !msg.answer && !msg.thinking" class="typing-indicator"
+                    style="margin-top: 8px;">
+                    <span></span><span></span><span></span>
+                  </div>
+
+                  <!-- 引用的知识库来源标签 -->
+                  <div v-if="msg.citations && msg.citations.length > 0" class="citations-container">
+                    <div class="citations-title">参考来源</div>
+                    <div class="citations-list">
+                      <div v-for="cit in msg.citations" :key="cit.id" class="citation-tag" :title="cit.name">
+                        <el-icon class="cit-icon">
+                          <Document />
+                        </el-icon>
+                        <span class="cit-name">{{ cit.name }}</span>
+                      </div>
+                    </div>
+                  </div>
                 </template>
                 <template v-else>{{ msg.answer || msg.content }}</template>
               </div>
             </div>
           </div>
 
-          <!-- Loading (基于 sessionId 隔离) -->
-          <div v-if="loadingMap[activeConversationId]" class="message-row assistant">
+          <!-- Loading (仅当最后一个消息不是正在生成的 Assistant 时显示，防止重复) -->
+          <div
+            v-if="loadingMap[activeConversationId] && (messages.length === 0 || messages[messages.length - 1].role !== 'assistant' || (messages[messages.length - 1].content))"
+            class="message-row assistant">
             <div class="message-avatar">🍃</div>
             <div class="message-bubble">
               <div class="typing-indicator">
@@ -2042,6 +2120,60 @@ const openSettings = async () => {
   flex: 1;
   font-weight: 500;
   color: #303133;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 引用来源样式 */
+.citations-container {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px dashed rgba(255, 255, 255, 0.1);
+}
+
+.citations-title {
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.5);
+  margin-bottom: 8px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.citations-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.citation-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.85);
+  cursor: default;
+  transition: all 0.2s;
+}
+
+.citation-tag:hover {
+  background: rgba(79, 172, 254, 0.1);
+  border-color: rgba(79, 172, 254, 0.3);
+  color: #fff;
+}
+
+.cit-icon {
+  font-size: 14px;
+  color: #4facfe;
+}
+
+.cit-name {
+  max-width: 180px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

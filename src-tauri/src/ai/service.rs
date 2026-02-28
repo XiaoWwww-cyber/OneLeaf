@@ -44,7 +44,7 @@ pub struct AttachmentInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamChunk {
     pub session_id: String,
-    /// "text" | "thinking"
+    /// "text" | "thinking" | "citations"
     pub chunk_type: String,
     pub delta: String,
     pub done: bool,

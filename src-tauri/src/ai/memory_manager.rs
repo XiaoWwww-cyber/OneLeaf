@@ -145,10 +145,16 @@ impl MemoryManager {
                     content_to_summarize
                 );
 
-                let messages = vec![ChatMessage {
-                    role: "user".to_string(),
-                    content: prompt,
-                }];
+                let messages = vec![
+                    ChatMessage {
+                        role: "system".to_string(),
+                        content: "你是一个专业的 AI 记忆管理助手。你负责从对话历史中提取核心事实并进行极简总结。请严格遵守字数要求，禁止直接回答对话中的问题。".to_string(),
+                    },
+                    ChatMessage {
+                        role: "user".to_string(),
+                        content: prompt,
+                    }
+                ];
 
                 let ai = ai_service_mtx.lock().clone();
                 // 强制不调用联网等复杂操作
@@ -197,10 +203,16 @@ impl MemoryManager {
                     content_to_extract
                 );
 
-                let messages = vec![ChatMessage {
-                    role: "user".to_string(),
-                    content: prompt,
-                }];
+                let messages = vec![
+                    ChatMessage {
+                        role: "system".to_string(),
+                        content: "你是一个专业的 AI 观察员。你负责分析对话并提取用户的长期偏好、职业身份或特定回复格式。请以客观第三人称进行极简概括。".to_string(),
+                    },
+                    ChatMessage {
+                        role: "user".to_string(),
+                        content: prompt,
+                    }
+                ];
 
                 let ai = ai_service_mtx.lock().clone();
                 match ai.chat(messages, false, None).await {

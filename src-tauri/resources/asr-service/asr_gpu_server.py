@@ -65,21 +65,13 @@ def get_models_dir() -> Path:
         res = app_data / "com.oneleaf.app" / "models" / "asr" / "sense-voice"
     else:
         res = Path.home() / ".local" / "share" / "com.oneleaf.app" / "models" / "asr" / "sense-voice"
-    print(f"[ASR-GPU] Resolved model dir: {res}")
     return res
 
-print(f"[ASR-GPU] Server Starting...", flush=True)
 model_dir = get_models_dir()
-print(f"[ASR-GPU] Model Dir: {model_dir}", flush=True)
-
-if model_dir.exists():
-    print(f"[ASR-GPU] Model Files: {[f.name for f in model_dir.iterdir()]}", flush=True)
-else:
-    print(f"[ASR-GPU] ERROR: Model directory does not exist!", flush=True)
 
 try:
     import sherpa_onnx
-    print(f"[ASR-GPU] Sherpa-ONNX imported successfully version: {sherpa_onnx.__version__}", flush=True)
+    print(f"[ASR-GPU] Server Starting ✅. Resolved Model Dir: {model_dir} | Model Files: {[f.name for f in model_dir.iterdir() if getattr(f, 'name', None)]} | Sherpa-ONNX Version: {sherpa_onnx.__version__}", flush=True)
 except ImportError as e:
     print(f"[ASR-GPU] ERROR: Failed to import sherpa_onnx: {e}", flush=True)
 except Exception as e:
